@@ -1,0 +1,46 @@
+# ============================================================
+# OFOQ — Docker Compose (Production)
+# Port: 3050 → Cloudflare Tunnel → ofoq.grade.sbs
+# ============================================================
+
+services:
+  ofoq-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ofoq-app
+    restart: unless-stopped
+    ports:
+      - "3050:3050"
+    volumes:
+      # Persist storage (uploads, logs)
+      - ofoq-storage:/var/www/html/storage
+      # Persist SQLite database
+      - ofoq-database:/var/www/html/database
+    environment:
+      - APP_NAME=OFOQ
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - APP_URL=https://ofoq.grade.sbs
+      - APP_LOCALE=ar
+      - LOG_CHANNEL=stack
+      - LOG_LEVEL=error
+      - DB_CONNECTION=sqlite
+      - SESSION_DRIVER=database
+      - QUEUE_CONNECTION=database
+      - CACHE_STORE=database
+      - SAR_TO_JOD=0.19
+    env_file:
+      - .env.production
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3050/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  ofoq-storage:
+    driver: local
+  ofoq-database:
+    driver: local
