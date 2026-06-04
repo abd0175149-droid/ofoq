@@ -17,7 +17,11 @@ fi
 # Generate app key if not set or empty
 if [ -z "$APP_KEY" ] || ! grep -q '^APP_KEY=base64:' .env; then
     echo "🔑 Generating application key..."
-    php artisan key:generate --force --no-interaction
+    NEW_KEY=$(php artisan key:generate --force --show)
+    sed -i "s|^APP_KEY=.*|APP_KEY=${NEW_KEY}|g" .env
+    if [ -f .env.production ]; then
+        sed -i "s|^APP_KEY=.*|APP_KEY=${NEW_KEY}|g" .env.production
+    fi
 fi
 
 # Export APP_KEY from .env file so it overrides the empty env var from docker-compose
