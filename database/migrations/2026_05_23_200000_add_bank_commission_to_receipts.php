@@ -8,7 +8,7 @@ return new class extends Migration
 {
     public function up(): void
     {
-        if (!Schema::hasColumn('receipts', 'bank_commission')) {
+        if (Schema::hasTable('receipts') && !Schema::hasColumn('receipts', 'bank_commission')) {
             Schema::table('receipts', function (Blueprint $table) {
                 $table->decimal('bank_commission', 15, 3)->default(0);
             });
