@@ -14,6 +14,8 @@ return new class extends Migration
         $tables = ['transfers', 'receipts', 'expenses', 'violations', 'invoices'];
 
         foreach ($tables as $table) {
+            if (!Schema::hasTable($table)) continue;
+
             if (!Schema::hasColumn($table, 'modified_by')) {
                 Schema::table($table, function (Blueprint $t) {
                     $t->unsignedBigInteger('modified_by')->nullable();
@@ -32,30 +34,32 @@ return new class extends Migration
         }
 
         // أعمدة الحوالات
-        if (!Schema::hasColumn('transfers', 'difference_amount')) {
-            Schema::table('transfers', function (Blueprint $t) {
-                $t->decimal('difference_amount', 15, 3)->default(0);
-            });
-        }
-        if (!Schema::hasColumn('transfers', 'difference_type')) {
-            Schema::table('transfers', function (Blueprint $t) {
-                $t->string('difference_type', 20)->nullable();
-            });
-        }
-        if (!Schema::hasColumn('transfers', 'expense_id')) {
-            Schema::table('transfers', function (Blueprint $t) {
-                $t->unsignedBigInteger('expense_id')->nullable();
-            });
-        }
-        if (!Schema::hasColumn('transfers', 'expense_category_id')) {
-            Schema::table('transfers', function (Blueprint $t) {
-                $t->unsignedBigInteger('expense_category_id')->nullable();
-            });
-        }
-        if (!Schema::hasColumn('transfers', 'revenue_account_id')) {
-            Schema::table('transfers', function (Blueprint $t) {
-                $t->unsignedBigInteger('revenue_account_id')->nullable();
-            });
+        if (Schema::hasTable('transfers')) {
+            if (!Schema::hasColumn('transfers', 'difference_amount')) {
+                Schema::table('transfers', function (Blueprint $t) {
+                    $t->decimal('difference_amount', 15, 3)->default(0);
+                });
+            }
+            if (!Schema::hasColumn('transfers', 'difference_type')) {
+                Schema::table('transfers', function (Blueprint $t) {
+                    $t->string('difference_type', 20)->nullable();
+                });
+            }
+            if (!Schema::hasColumn('transfers', 'expense_id')) {
+                Schema::table('transfers', function (Blueprint $t) {
+                    $t->unsignedBigInteger('expense_id')->nullable();
+                });
+            }
+            if (!Schema::hasColumn('transfers', 'expense_category_id')) {
+                Schema::table('transfers', function (Blueprint $t) {
+                    $t->unsignedBigInteger('expense_category_id')->nullable();
+                });
+            }
+            if (!Schema::hasColumn('transfers', 'revenue_account_id')) {
+                Schema::table('transfers', function (Blueprint $t) {
+                    $t->unsignedBigInteger('revenue_account_id')->nullable();
+                });
+            }
         }
 
         // إضافة الصلاحيات

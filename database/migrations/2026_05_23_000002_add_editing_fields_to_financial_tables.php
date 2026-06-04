@@ -19,7 +19,7 @@ return new class extends Migration
         // SQLite لا يدعم ALTER TABLE ADD COLUMN مع FOREIGN KEY
         // لذلك نضيف الأعمدة بدون foreign key constraint
         foreach ($this->tables as $table) {
-            if (!Schema::hasColumn($table, 'modified_by')) {
+            if (Schema::hasTable($table) && !Schema::hasColumn($table, 'modified_by')) {
                 Schema::table($table, function (Blueprint $t) {
                     $t->unsignedBigInteger('modified_by')->nullable();
                     $t->datetime('modified_at')->nullable();
