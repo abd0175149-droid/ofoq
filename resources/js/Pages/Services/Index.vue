@@ -28,6 +28,7 @@
                     <tr v-if="!services.data?.length"><td colspan="4" class="px-5 py-12 text-center text-gray-400">لا يوجد خدمات</td></tr>
                 </tbody>
             </table></div>
+            <Pagination :links="services.links" :filters="{search: search}" />
         </div>
         <!-- Form Modal -->
         <div v-if="showForm" class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" @click.self="showForm=false">
@@ -59,6 +60,7 @@
 import { ref } from 'vue';
 import { router, useForm } from '@inertiajs/vue3';
 import AppLayout from '@/Components/Layout/SmartLayout.vue';
+import Pagination from '@/Components/Pagination.vue';
 import { usePermissions } from '@/composables/usePermissions';
 const { can } = usePermissions();
 const props = defineProps({ services: Object, filters: Object });

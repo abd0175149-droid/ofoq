@@ -58,6 +58,7 @@
                 </table>
                 </div>
             </div>
+            <Pagination :links="invoices.links" :filters="{search: search, status: statusFilter}" />
         </div>
 
         <!-- POS Modal -->
@@ -192,6 +193,7 @@
 import { ref, computed, reactive } from 'vue';
 import { router } from '@inertiajs/vue3';
 import AppLayout from '@/Components/Layout/SmartLayout.vue';
+import Pagination from '@/Components/Pagination.vue';
 import { usePermissions } from '@/composables/usePermissions';
 import { useHighlight } from '@/composables/useHighlight';
 const { can } = usePermissions();

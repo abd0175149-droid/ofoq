@@ -36,6 +36,7 @@
                 </table>
                 </div>
             </div>
+            <Pagination :links="clients.links" :filters="{search: search}" />
         </div>
 
         <!-- View Modal -->
@@ -113,6 +114,7 @@
 import { ref, computed, watch } from 'vue';
 import { router, useForm } from '@inertiajs/vue3';
 import AppLayout from '@/Components/Layout/SmartLayout.vue';
+import Pagination from '@/Components/Pagination.vue';
 import { usePermissions } from '@/composables/usePermissions';
 const { can } = usePermissions();
 

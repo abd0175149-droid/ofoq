@@ -4,11 +4,14 @@
         <div class="space-y-6">
             <div v-if="$page.props.flash?.success" class="p-4 rounded-xl border text-sm bg-green-50 border-green-200 text-green-700">✅ {{ $page.props.flash.success }}</div>
             <div v-if="$page.props.flash?.error" class="p-4 rounded-xl border text-sm bg-red-50 border-red-200 text-red-700">❌ {{ $page.props.flash.error }}</div>
-            <div class="flex justify-end filter-bar"><button @click="openModal(null)" class="px-5 py-2.5 rounded-xl font-bold text-sm text-black bg-gradient-to-r from-gold-500 to-gold-400 shadow-md w-full sm:w-auto">+ تصنيف جديد</button></div>
+            <div class="flex flex-wrap items-center justify-between gap-4 filter-bar">
+                <input v-model="search" type="text" placeholder="بحث..." class="w-64 max-w-full px-4 py-2.5 rounded-xl border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-gold-500" @input="debounceSearch"/>
+                <button @click="openModal(null)" class="px-5 py-2.5 rounded-xl font-bold text-sm text-black bg-gradient-to-r from-gold-500 to-gold-400 shadow-md w-full sm:w-auto">+ تصنيف جديد</button>
+            </div>
             <div class="rounded-xl border overflow-hidden shadow-sm bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700"><table class="w-full text-sm responsive-table">
                 <thead><tr class="bg-gray-50 dark:bg-gray-800/50 text-gray-600 dark:text-gray-400"><th class="px-5 py-3 text-right font-bold">الاسم</th><th class="px-5 py-3 text-right font-bold hide-mobile">الكود</th><th class="px-5 py-3 text-right font-bold hide-mobile">الحساب المحاسبي</th><th class="px-5 py-3 text-right font-bold">الحالة</th><th class="px-5 py-3 text-center font-bold">إجراءات</th></tr></thead>
                 <tbody>
-                    <tr v-for="c in categories" :key="c.id" class="border-t border-gray-100 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-800/30">
+                    <tr v-for="c in categories.data" :key="c.id" class="border-t border-gray-100 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-800/30">
                         <td data-label="الاسم" class="px-5 py-3 font-medium text-gray-800 dark:text-gray-100">{{ c.name }}</td>
                         <td data-label="الكود" class="px-5 py-3 font-mono text-xs text-gold-700 hide-mobile">{{ c.code }}</td>
                         <td data-label="الحساب" class="px-5 py-3 text-sm hide-mobile">
@@ -22,9 +25,10 @@
                         <td data-label="الحالة" class="px-5 py-3"><span class="px-2 py-0.5 rounded-full text-xs font-bold" :class="c.is_active?'bg-green-100 text-green-700':'bg-red-100 text-red-700'">{{ c.is_active?'نشط':'معطل' }}</span></td>
                         <td data-label="" class="px-5 py-3 text-center actions-cell"><button @click="openModal(c)" class="px-2 py-1 text-xs text-gold-700 hover:bg-gold-50 rounded-lg btn-mobile-sm">✏️</button><button @click="del(c)" class="px-2 py-1 text-xs text-red-600 hover:bg-red-50 rounded-lg btn-mobile-sm">🗑️</button></td>
                     </tr>
-                    <tr v-if="!categories.length"><td colspan="5" class="px-5 py-12 text-center text-gray-400">لا يوجد تصنيفات</td></tr>
+                    <tr v-if="!categories.data?.length"><td colspan="5" class="px-5 py-12 text-center text-gray-400">لا يوجد تصنيفات</td></tr>
                 </tbody>
             </table></div>
+            <Pagination :links="categories.links" :filters="{search: search}" />
         </div>
 
         <!-- Modal إنشاء/تعديل -->
@@ -67,10 +71,13 @@
 import { ref } from 'vue';
 import { router, useForm } from '@inertiajs/vue3';
 import AppLayout from '@/Components/Layout/SmartLayout.vue';
+import Pagination from '@/Components/Pagination.vue';
 import { usePermissions } from '@/composables/usePermissions';
 const { can } = usePermissions();
-const props = defineProps({ categories: Array, expenseAccounts: Array });
+const props = defineProps({ categories: Object, expenseAccounts: Array, filters: Object });
+const search = ref(props.filters?.search||'');
 const showForm = ref(false); const editItem = ref(null); const deleteTarget = ref(null);
+let t=null;
 const form = useForm({ name:'', description:'', is_active:true, account_id: null });
 const openModal = (c) => {
     editItem.value = c;
@@ -90,4 +97,5 @@ const submit = () => {
     editItem.value ? form.put('/expense-categories/'+editItem.value.id, o) : form.post('/expense-categories', o);
 };
 const del = (c) => { deleteTarget.value=c; };
+const debounceSearch=()=>{clearTimeout(t);t=setTimeout(()=>router.get('/expense-categories',{search:search.value},{preserveState:true,replace:true}),400)};
 </script>

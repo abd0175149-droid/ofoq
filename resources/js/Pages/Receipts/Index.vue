@@ -31,6 +31,7 @@
                     </td>
                 </tr><tr v-if="!receipts.data?.length"><td colspan="8" class="px-5 py-12 text-center text-gray-400">لا يوجد سندات</td></tr></tbody>
             </table></div>
+            <Pagination :links="receipts.links" :filters="{search: search}" />
         </div>
 
         <!-- فورم إنشاء سند جديد -->
@@ -90,6 +91,7 @@
 import { ref, computed } from 'vue';
 import { router, useForm } from '@inertiajs/vue3';
 import AppLayout from '@/Components/Layout/SmartLayout.vue';
+import Pagination from '@/Components/Pagination.vue';
 import SearchableSelect from '@/Components/SearchableSelect.vue';
 import { usePermissions } from '@/composables/usePermissions';
 import { useHighlight } from '@/composables/useHighlight';
