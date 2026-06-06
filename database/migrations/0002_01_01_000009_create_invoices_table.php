@@ -56,15 +56,17 @@ return new class extends Migration
                 $table->id();
                 $table->foreignId('invoice_id')->constrained('invoices')->cascadeOnDelete();
                 $table->foreignId('agent_id')->nullable()->constrained('agents');
-                $table->string('item_type', 30)->default('visa'); // visa, service, other
+                $table->string('item_type', 30)->default('service'); // visa, service, other
                 $table->foreignId('service_id')->nullable()->constrained('services');
                 $table->string('description', 255)->nullable();
+                $table->text('statement')->nullable();
                 $table->integer('quantity')->default(1);
                 $table->decimal('unit_price_sar', 15, 2)->default(0);
-                $table->decimal('total_sar', 15, 2)->default(0);
+                $table->decimal('unit_price_jod', 15, 3)->default(0);
+                $table->decimal('total_cost_sar', 15, 2)->default(0);
+                $table->decimal('total_cost_jod', 15, 3)->default(0);
                 $table->decimal('sell_price_jod', 15, 3)->default(0);
-                $table->decimal('cost_sar', 15, 2)->default(0);
-                $table->decimal('cost_jod', 15, 3)->default(0);
+                $table->decimal('total_sell_jod', 15, 3)->default(0);
                 $table->integer('sort_order')->default(0);
                 $table->timestamps();
             });
