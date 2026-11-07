@@ -1,0 +1,6 @@
+# OFOQ security contact (RFC 9116). Policy: SECURITY.md in the repository, summary at /privacy#security
+Contact: mailto:info@ofoq.masaros.net
+Expires: 2027-09-30T00:00:00.000Z
+Preferred-Languages: ar, en
+Policy: https://ofoq.masaros.net/privacy#security
+Canonical: https://ofoq.masaros.net/.well-known/security.txt

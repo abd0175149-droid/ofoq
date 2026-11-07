@@ -1,0 +1,142 @@
+# ============================================================
+# OFOQ — Docker Compose (Production)
+# Port: 3050 → Cloudflare Tunnel → ofoq.masaros.net
+# ============================================================
+
+services:
+  ofoq-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # VITE_* لمرحلة الواجهة دون خبز .env.production في الصورة
+      secrets:
+        - vite_env
+    container_name: ofoq-app
+    restart: unless-stopped
+    # يتسع لـ stopwaitsecs=130 لعامل الطابور: وظيفة رد جارية تكتمل بدل أن تُقتل عند كل نشر
+    stop_grace_period: 140s
+    # تقوية الحاوية (E26.8). no-new-privileges: supervisord وphp-fpm وnginx يُسقطون الصلاحيات من root ولا يرفعونها،
+    # وكروميوم يعمل بـ --no-sandbox. الحدود في /home/sysadmin/ofoq/.env (تعويض compose) بعد قياس scripts/security/measure-memory.sh
+    # وops:smoke-card: الذاكرة ضعف القمة ولا تقل عن 2g، وpids يعدّ الخيوط (كروميوم وحده عشرات، و20 عامل php-fpm والطوابير وReverb).
+    # 0 يرفع الحد في الطوارئ. مؤجل عمداً: read_only وcap_drop [ALL]، لأن الإقلاع ينفّذ chown وconfig:cache بـ root
+    # وsupervisord يبدأ بـ root؛ تغيير ذلك مشروع مستقل يمس قالب كل المشاريع
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: ${OFOQ_MEM_LIMIT:-3g}
+    memswap_limit: ${OFOQ_MEM_LIMIT:-3g}
+    pids_limit: ${OFOQ_PIDS_LIMIT:-1024}
+    cpus: ${OFOQ_CPUS:-2.0}
+    ports:
+      # OFOQ_BIND_ADDRESS=127.0.0.1 (في /home/sysadmin/ofoq/.env لتعويض compose) يقصر المنفذ على المضيف بعد تحويل قاعدة النفق
+      # إلى http://127.0.0.1:3050 (docs/RELEASE.md «ربط المنفذ»). بلا قيمة: كل الواجهات كما اليوم
+      - "${OFOQ_BIND_ADDRESS:-}${OFOQ_BIND_ADDRESS:+:}3050:3050"
+    volumes:
+      # Persist storage (uploads, logs)
+      - ofoq-storage:/var/www/html/storage
+      # القاعدة وحدها في حجمها (database/data)، فتصل هجرات الصورة الجديدة بالبناء دون docker cp.
+      # الانتقال من الحجم القديم بـ scripts/backup/move-db-volume.sh (docs/RELEASE.md)، لا بإعادة التشغيل.
+      - ofoq-dbdata:/var/www/html/database/data
+    environment:
+      - APP_NAME=OFOQ
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - APP_URL=https://ofoq.masaros.net
+      - APP_LOCALE=ar
+      - LOG_CHANNEL=stack
+      # warning لا error: تحذيرات الواتساب (حدث حساب، توقيع خاطئ) كانت تسقط. يومي بـ 14 يوماً
+      - LOG_LEVEL=warning
+      - LOG_STACK=daily
+      - LOG_DAILY_DAYS=14
+      # أحداث الواتساب في storage/logs/whatsapp-*.log (JSON، بلا بيانات عملاء)
+      - WA_LOG_LEVEL=info
+      - DB_CONNECTION=sqlite
+      - DB_DATABASE=/var/www/html/database/data/database.sqlite
+      # E07.11: WAL ومهلة القفل 60 ثانية (صريحة هنا لا في الافتراضي وحده). IMMEDIATE منذ 2026-10-19: مع DEFERRED
+      # كان حجز وظيفة من الطابور يفشل فوراً بـ «database is locked» عند ترقية القراءة إلى كتابة (14 مرة في يومين)
+      - DB_JOURNAL_MODE=wal
+      - DB_BUSY_TIMEOUT=60000
+      - DB_SYNCHRONOUS=normal
+      - DB_TRANSACTION_MODE=IMMEDIATE
+      # E08: فحص /up الحقيقي وفحوص ميتا. مطفآن حتى يُضبطا في /home/sysadmin/ofoq/.env (تعويض compose)، مرحلةً مرحلة (docs/RELEASE.md)
+      - OPS_HEALTH_CHECKS=${OPS_HEALTH_CHECKS:-false}
+      - WA_META_CHECKS=${WA_META_CHECKS:-false}
+      # E09: أحداث التدقيق غير المالية وصفحة /audit-logs (مطفآن حتى يُضبطا في /home/sysadmin/ofoq/.env)
+      - AUDIT_EXTENDED=${AUDIT_EXTENDED:-false}
+      - AUDIT_PAGE=${AUDIT_PAGE:-false}
+      # E13: مدة الاحتفاظ بالمحادثات (0 = لا تقليم) حتى يقرّرها المالك في /home/sysadmin/ofoq/.env
+      - WA_RETENTION_DAYS=${WA_RETENTION_DAYS:-0}
+      # E26: سياسة أمن المحتوى (report افتراضياً: تقارير بلا حجب؛ enforce بعد أسبوع نظيف؛ off للطوارئ)،
+      # وصلاحيات storage (legacy حتى يُتحقق من ضم nginx إلى مجموعة www-data، ثم strict: 750/640)
+      - CSP_MODE=${CSP_MODE:-report}
+      - CSP_CONNECT_EXTRA=${CSP_CONNECT_EXTRA:-}
+      - OFOQ_STORAGE_PERMS=${OFOQ_STORAGE_PERMS:-legacy}
+      - SESSION_DRIVER=database
+      - QUEUE_CONNECTION=database
+      - CACHE_STORE=database
+      - SAR_TO_JOD=0.19
+      # E28: الخادم ينشر إلى Reverb داخل الحاوية مباشرة (لا عبر النفق و/apps)، بمهلة ثانيتين. المتصفح على VITE_REVERB_*.
+      # أصل المقبس بالمضيف وحده؛ '*' مؤقتاً في /home/sysadmin/ofoq/.env للتراجع (docs/RELEASE.md «البث اللحظي الآمن»)
+      - REVERB_PUBLISH_HOST=${REVERB_PUBLISH_HOST:-127.0.0.1}
+      - REVERB_PUBLISH_PORT=${REVERB_PUBLISH_PORT:-8080}
+      - REVERB_PUBLISH_SCHEME=${REVERB_PUBLISH_SCHEME:-http}
+      - REVERB_ALLOWED_ORIGINS=${REVERB_ALLOWED_ORIGINS:-ofoq.masaros.net}
+    env_file:
+      - .env.production
+    # سجلات الحاوية مدوّرة: 5 ملفات × 10MB (nginx وphp-fpm يكتبان إلى stdout/stderr)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      # /up يفحص القاعدة والمجدول والعاملين (OPS_HEALTH_CHECKS)؛ / كان ينجح بمجرد التحويل إلى صفحة الدخول.
+      # start_period: أول نبضة بعد الإقلاع. unhealthy للرؤية والتنبيه فقط، لا إعادة تشغيل آلية
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Accept: application/json", "http://localhost:3050/up"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # تمرين الاستعادة المعزول (scripts/backup/drill.sh): لا شبكة، ولا أي حجم إنتاجي، ونظام ملفات للقراءة فقط.
+  # لا يعمل مع «docker compose up»؛ فقط: docker compose --profile drill run --rm -T ofoq-drill
+  ofoq-drill:
+    image: ${DRILL_IMAGE:-ofoq-ofoq-app:latest}
+    profiles: [drill]
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+      - /var/www/html/storage:size=256m
+      - /var/www/html/bootstrap/cache:size=16m
+    env_file:
+      - .env.production
+    environment:
+      - APP_ENV=production
+      - DB_CONNECTION=sqlite
+      - DB_DATABASE=/tmp/drill/database.sqlite
+      - CACHE_STORE=array
+      - QUEUE_CONNECTION=sync
+      - SESSION_DRIVER=array
+      - BROADCAST_CONNECTION=null
+      - BACKUP_PRE_MIGRATE=false
+      - LOG_CHANNEL=stderr
+    entrypoint: ["/bin/sh", "/var/www/html/docker/drill-inside.sh"]
+
+secrets:
+  vite_env:
+    file: ./.env.production
+
+volumes:
+  ofoq-storage:
+    driver: local
+  ofoq-dbdata:
+    driver: local
+
+
+
+# مجمّعات عناوين docker على الخادم ممتلئة: شبكة بمدى ثابت على نمط wbagent وsura (10.120–10.123)
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.125.0.0/24

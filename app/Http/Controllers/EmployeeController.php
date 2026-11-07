@@ -1,0 +1,229 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Department;
+use App\Models\Employee;
+use App\Models\Shift;
+use App\Models\User;
+use App\Services\NumberingService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Inertia\Inertia;
+
+class EmployeeController extends Controller
+{
+    public function index(Request $request)
+    {
+        $employees = Employee::with(['user:id,name,email,phone', 'department:id,name', 'shift:id,name'])
+            ->when($request->search, function ($q, $s) {
+                $q->whereHas('user', fn($q2) => $q2->where('name', 'like', "%{$s}%"))
+                  ->orWhere('employee_number', 'like', "%{$s}%")
+                  ->orWhere('national_id', 'like', "%{$s}%");
+            })
+            ->when($request->department_id, fn($q, $d) => $q->where('department_id', $d))
+            ->when($request->country, fn($q, $c) => $q->where('country', $c))
+            ->when($request->has('is_active'), fn($q) => $q->where('is_active', $request->boolean('is_active')))
+            ->orderByDesc('created_at')
+            ->paginate(15)
+            ->withQueryString();
+
+        $departments = Department::select('id', 'name')->whereIsActive(true)->get();
+
+        return Inertia::render('HR/Employees/Index', [
+            'title' => 'الموظفين',
+            'employees' => $employees,
+            'departments' => $departments,
+            'filters' => $request->only(['search', 'department_id', 'country', 'is_active']),
+        ]);
+    }
+
+    public function create()
+    {
+        abort_unless(auth()->user()->can('employees.create'), 403);
+
+        // Only users without an employee profile
+        $users = User::whereDoesntHave('employee')->whereIsActive(true)->select('id', 'name', 'email')->get();
+        $departments = Department::select('id', 'name')->whereIsActive(true)->get();
+        $shifts = Shift::select('id', 'name')->whereIsActive(true)->get();
+        // الأدوار التي يحق لهذا المستخدم إسنادها فقط
+        $roles = \App\Services\Security\RoleAssignmentGuard::assignableRoles(auth()->user());
+
+        return Inertia::render('HR/Employees/Create', [
+            'title' => 'إضافة موظف جديد',
+            'users' => $users,
+            'departments' => $departments,
+            'shifts' => $shifts,
+            'roles' => $roles,
+        ]);
+    }
+
+    public function store(Request $request, NumberingService $numberingService)
+    {
+        abort_unless(auth()->user()->can('employees.create'), 403);
+
+        $validated = $request->validate([
+            'user_mode' => 'required|in:existing,new',
+            'user_id' => 'required_if:user_mode,existing|nullable|exists:users,id|unique:employees,user_id',
+            'new_user_name' => 'required_if:user_mode,new|nullable|string|max:255',
+            'new_user_email' => 'required_if:user_mode,new|nullable|email|max:255|unique:users,email',
+            'new_user_password' => 'required_if:user_mode,new|nullable|string|min:6',
+            'new_user_role_id' => 'required_if:user_mode,new|nullable|exists:roles,id',
+            'department_id' => 'nullable|exists:departments,id',
+            'shift_id' => 'nullable|exists:shifts,id',
+            'job_title' => 'nullable|string|max:150',
+            'hire_date' => 'required|date',
+            'contract_type' => 'required|in:full_time,part_time,contract',
+            'country' => 'required|in:SA,JO',
+            'currency' => 'required|in:SAR,JOD',
+            
+            'basic_salary' => 'required|numeric|min:0',
+            'housing_allowance' => 'required|numeric|min:0',
+            'transport_allowance' => 'required|numeric|min:0',
+            'other_allowance' => 'required|numeric|min:0',
+            
+            'overtime_calc_method' => 'required|in:fixed,multiplier',
+            'overtime_hourly_rate' => 'required_if:overtime_calc_method,fixed|numeric|min:0',
+            'overtime_multiplier' => 'required_if:overtime_calc_method,multiplier|numeric|min:1',
+            
+            'custom_grace_minutes' => 'nullable|integer|min:0',
+            
+            'bank_name' => 'nullable|string|max:100',
+            'bank_account' => 'nullable|string|max:50',
+            'bank_swift' => 'nullable|string|max:20',
+            
+            'national_id' => 'nullable|string|max:30',
+            'passport_number' => 'nullable|string|max:30',
+            
+            'notes' => 'nullable|string',
+            'is_active' => 'boolean',
+        ]);
+
+        // إنشاء حساب دخول جديد يخضع لنفس قيود إدارة المستخدمين
+        if (($validated['user_mode'] ?? 'existing') === 'new') {
+            $actor = auth()->user();
+            abort_unless($actor->can('users.create'), 403);
+            $role = \App\Models\Role::findOrFail($validated['new_user_role_id']);
+            abort_unless(\App\Services\Security\RoleAssignmentGuard::canAssign($actor, $role), 403, 'لا تملك صلاحية إسناد هذا الدور');
+        }
+
+        DB::transaction(function () use ($validated, $request, $numberingService) {
+            // إنشاء مستخدم جديد تلقائياً إن اختار المستخدم ذلك
+            if (($validated['user_mode'] ?? 'existing') === 'new') {
+                $user = new User([
+                    'name' => $validated['new_user_name'],
+                    'email' => $validated['new_user_email'],
+                    'password' => \Illuminate\Support\Facades\Hash::make($validated['new_user_password']),
+                    'phone' => $request->input('phone'),
+                ]);
+                $user->forceFill([
+                    'role_id' => $validated['new_user_role_id'],
+                    'is_active' => true,
+                ])->save();
+                \App\Models\AuditLog::log(\App\Enums\AuditAction::UserCreate, 'User', $user->id, $user->name, ['via' => 'employee']);
+                $validated['user_id'] = $user->id;
+            }
+
+            // تنظيف الحقول غير الخاصة بجدول الموظفين
+            unset($validated['user_mode'], $validated['new_user_name'], $validated['new_user_email'],
+                  $validated['new_user_password'], $validated['new_user_role_id']);
+
+            $validated['employee_number'] = $numberingService->generate('EMP');
+            Employee::create($validated);
+        });
+
+        return redirect()->route('employees.index')->with('success', 'تم إضافة الموظف بنجاح');
+    }
+
+    public function show(Employee $employee)
+    {
+        $employee->load([
+            'user', 
+            'department', 
+            'shift', 
+            'leaveBalances.leaveType',
+            'advances' => fn($q) => $q->latest()->take(5),
+            'attendances' => fn($q) => $q->latest()->take(5),
+        ]);
+
+        return Inertia::render('HR/Employees/Show', [
+            'title' => 'ملف الموظف',
+            'employee' => $employee,
+        ]);
+    }
+
+    public function edit(Employee $employee)
+    {
+        $employee->load(['user']);
+        
+        $users = User::where(function($q) use ($employee) {
+            $q->whereDoesntHave('employee')->orWhere('id', $employee->user_id);
+        })->whereIsActive(true)->select('id', 'name', 'email')->get();
+        
+        $departments = Department::select('id', 'name')->whereIsActive(true)->get();
+        $shifts = Shift::select('id', 'name')->whereIsActive(true)->get();
+
+        return Inertia::render('HR/Employees/Edit', [
+            'title' => 'تعديل موظف',
+            'employee' => $employee,
+            'users' => $users,
+            'departments' => $departments,
+            'shifts' => $shifts,
+        ]);
+    }
+
+    public function update(Request $request, Employee $employee)
+    {
+        $validated = $request->validate([
+            'user_id' => 'required|exists:users,id|unique:employees,user_id,' . $employee->id,
+            'department_id' => 'nullable|exists:departments,id',
+            'shift_id' => 'nullable|exists:shifts,id',
+            'job_title' => 'nullable|string|max:150',
+            'hire_date' => 'required|date',
+            'contract_type' => 'required|in:full_time,part_time,contract',
+            'country' => 'required|in:SA,JO',
+            'currency' => 'required|in:SAR,JOD',
+            
+            'basic_salary' => 'required|numeric|min:0',
+            'housing_allowance' => 'required|numeric|min:0',
+            'transport_allowance' => 'required|numeric|min:0',
+            'other_allowance' => 'required|numeric|min:0',
+            
+            'overtime_calc_method' => 'required|in:fixed,multiplier',
+            'overtime_hourly_rate' => 'required_if:overtime_calc_method,fixed|numeric|min:0',
+            'overtime_multiplier' => 'required_if:overtime_calc_method,multiplier|numeric|min:1',
+            
+            'custom_grace_minutes' => 'nullable|integer|min:0',
+            
+            'bank_name' => 'nullable|string|max:100',
+            'bank_account' => 'nullable|string|max:50',
+            'bank_swift' => 'nullable|string|max:20',
+            
+            'national_id' => 'nullable|string|max:30',
+            'passport_number' => 'nullable|string|max:30',
+            
+            'notes' => 'nullable|string',
+            'is_active' => 'boolean',
+        ]);
+
+        $employee->update($validated);
+
+        return redirect()->route('employees.index')->with('success', 'تم تحديث الموظف بنجاح');
+    }
+
+    public function destroy(Employee $employee)
+    {
+        if ($employee->payrollItems()->count() > 0 || $employee->advances()->count() > 0) {
+            return back()->with('error', 'لا يمكن حذف موظف لديه رواتب أو سلف مسجلة.');
+        }
+
+        $employee->delete();
+        return redirect()->route('employees.index')->with('success', 'تم حذف الموظف بنجاح');
+    }
+
+    public function printStatement(Employee $employee)
+    {
+        // To be implemented in Reports Sprint
+        abort(404);
+    }
+}

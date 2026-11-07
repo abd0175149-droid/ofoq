@@ -1,0 +1,258 @@
+<template>
+    <AppLayout>
+        <template #header>الإعدادات</template>
+        <div class="space-y-8">
+            <div v-if="$page.props.flash?.success" class="p-4 rounded-xl border text-sm bg-green-50 border-green-200 text-green-700">✅ {{ $page.props.flash.success }}</div>
+
+            <Link v-if="lastBackup" href="/settings/backups"
+                  class="flex items-center gap-2 p-3 rounded-xl border text-sm"
+                  :class="backupAgeHours !== null && backupAgeHours <= 26 ? 'bg-green-50 border-green-200 text-green-700' : 'bg-amber-50 border-amber-200 text-amber-800'">
+                🛟 <span v-if="backupAgeHours !== null">آخر نسخة احتياطية قبل {{ backupAgeHours }} ساعة</span>
+                <span v-else>لا توجد نسخة احتياطية ناجحة بعد</span>
+                <span class="mr-auto underline text-xs">النسخ الاحتياطي</span>
+            </Link>
+
+            <!-- سعر الصرف (ثابت) -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+                <h3 class="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2">💱 سعر الصرف</h3>
+                <div class="flex items-center gap-6">
+                    <div class="flex items-center gap-3 p-4 rounded-xl bg-gold-50 border border-gold-200">
+                        <span class="text-3xl">💱</span>
+                        <div>
+                            <p class="text-xs text-gray-500 mb-1">SAR → JOD (ثابت)</p>
+                            <p class="text-2xl font-bold font-mono text-gold-700" dir="ltr">0.190000</p>
+                        </div>
+                    </div>
+                    <div class="text-sm text-gray-500">
+                        <p>⚙️ سعر الصرف مثبت على <strong class="text-gold-700">0.19</strong></p>
+                        <p class="text-xs mt-1 text-gray-400">يُستخدم في جميع العمليات (الفواتير، الحوالات، المحاسبة)</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- الإعدادات العامة -->
+            <div v-for="(items, group) in settings" v-show="editable(items).length" :key="group" class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+                <h3 class="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2">
+                    {{ {company:'🏢 بيانات الشركة',printing:'🖨️ الطباعة',notifications:'🔔 الإشعارات',financial:'💰 المالية'}[group]||('⚙️ '+group) }}
+                </h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <!-- إعدادات الصور تُدار من قسم «هوية بطاقات العروض» لا كمسار نصّي -->
+                    <div v-for="item in editable(items)" :key="item.key">
+                        <label class="block text-sm font-medium text-gray-700 mb-1">{{ item.description || item.key }}</label>
+                        <template v-if="item.type==='boolean'">
+                            <label class="flex items-center gap-2"><input v-model="settingsData[item.key]" type="checkbox" true-value="1" false-value="0" class="w-4 h-4 rounded text-gold-500"/><span class="text-sm text-gray-600">تفعيل</span></label>
+                        </template>
+                        <template v-else-if="item.type==='text'">
+                            <textarea v-model="settingsData[item.key]" rows="2" class="w-full px-4 py-2.5 rounded-xl border border-gray-200 text-sm focus:ring-2 focus:ring-gold-500 focus:outline-none resize-none"></textarea>
+                        </template>
+                        <template v-else>
+                            <input v-model="settingsData[item.key]" class="w-full px-4 py-2.5 rounded-xl border border-gray-200 text-sm focus:ring-2 focus:ring-gold-500 focus:outline-none"/>
+                        </template>
+                        <!-- ملف واتساب للأعمال (E31): عدّاد بحد ميتا الرسمي وشرح الحقل -->
+                        <p v-if="LIMITS[item.key]" class="mt-1 text-[11px] tabular-nums" :class="lengthOf(settingsData[item.key]) > LIMITS[item.key] ? 'font-bold text-red-600' : 'text-gray-400'">
+                            <bdi dir="ltr">{{ lengthOf(settingsData[item.key]) }}/{{ LIMITS[item.key] }}</bdi>
+                        </p>
+                        <p v-if="HINTS[item.key]" class="mt-1 text-[11px] text-gray-500">{{ HINTS[item.key] }}</p>
+                        <p v-if="$page.props.errors?.['values.' + item.key]" class="mt-1 text-xs text-red-600">{{ $page.props.errors['values.' + item.key] }}</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- هوية بطاقات العروض -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+                <h3 class="text-lg font-bold text-gray-800 mb-1 flex items-center gap-2">🖼️ هوية بطاقات العروض</h3>
+                <p class="text-xs text-gray-500 mb-4">تُستخدم في بطاقات العروض وفي ترويسة الفواتير المطبوعة</p>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <!-- الشعار -->
+                    <div class="p-4 rounded-xl border border-dashed border-gray-300 bg-gray-50">
+                        <h4 class="font-bold text-sm text-gray-700 mb-2">🏷️ شعار الشركة</h4>
+                        <p class="text-xs text-gray-500 mb-3">يُفضّل PNG بخلفية شفافة — يظهر أعلى البطاقة</p>
+                        <div v-if="brand?.logo" class="mb-3 p-2 bg-white rounded-lg border border-gray-200 flex items-center gap-3">
+                            <img :src="brand.logo" alt="شعار الشركة" class="max-h-14"/>
+                            <a :href="brand.logo" target="_blank" class="text-xs text-blue-600 hover:underline">فتح</a>
+                        </div>
+                        <form @submit.prevent="uploadBrand('logo')" enctype="multipart/form-data">
+                            <input ref="logoFile" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" class="block w-full text-xs text-gray-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-gold-100 file:text-gold-700 hover:file:bg-gold-200"/>
+                            <button type="submit" class="mt-2 px-4 py-2 rounded-lg text-xs font-bold text-white bg-gold-600 hover:bg-gold-700">📤 رفع الشعار</button>
+                        </form>
+                        <p v-if="lastBrand === 'logo' && $page.props.errors?.asset" class="mt-2 text-xs text-red-600" role="alert">{{ $page.props.errors.asset }}</p>
+                    </div>
+                    <!-- ورقة الشركة الرسمية -->
+                    <div class="p-4 rounded-xl border border-dashed border-gray-300 bg-gray-50 md:col-span-2">
+                        <h4 class="font-bold text-sm text-gray-700 mb-2">📄 ورقة الشركة الرسمية (اختياري)</h4>
+                        <p class="text-xs text-gray-500 mb-3">
+                            ارفع ورقتك الرسمية كاملة بمقاس A4 عمودي، فتصير خلفية البطاقة وخلفية فاتورة «⬇️ PDF»، ويُرسم الجدول داخل بياضها.
+                            عند استخدامها يُخفى شريط الترويسة وشريط التواصل لأنّ الورقة تحملهما أصلاً.
+                        </p>
+                        <p class="text-xs text-gray-500 mb-3">صورة PNG أو JPG، أو ملف PDF (مثل قالب الطباعة نفسه): تُؤخذ صفحته الأولى.</p>
+                        <div v-if="brand?.letterhead" class="mb-3 p-2 bg-white rounded-lg border border-gray-200 flex items-start gap-3">
+                            <img :src="brand.letterhead" alt="ورقة الشركة" class="max-h-36 rounded border border-gray-100"/>
+                            <a :href="brand.letterhead" target="_blank" class="text-xs text-blue-600 hover:underline">فتح</a>
+                        </div>
+                        <form @submit.prevent="uploadBrand('letterhead')" enctype="multipart/form-data">
+                            <input ref="letterheadFile" type="file" accept="image/png,image/jpeg,application/pdf,.pdf" class="block w-full text-xs text-gray-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-purple-100 file:text-purple-700 hover:file:bg-purple-200"/>
+                            <button type="submit" class="mt-2 px-4 py-2 rounded-lg text-xs font-bold text-white bg-purple-600 hover:bg-purple-700">📤 رفع الورقة</button>
+                        </form>
+                        <p v-if="lastBrand === 'letterhead' && $page.props.errors?.asset" class="mt-2 text-xs text-red-600" role="alert">{{ $page.props.errors.asset }}</p>
+                        <div v-if="brand?.letterhead" class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700 mb-1">ارتفاع ترويسة الورقة (% من الصفحة)</label>
+                                <input v-model="settingsData.card_letterhead_top" type="number" min="0" max="60" step="0.5" dir="ltr"
+                                       class="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm font-mono focus:ring-2 focus:ring-gold-500 focus:outline-none"/>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700 mb-1">ارتفاع تذييل الورقة (% من الصفحة)</label>
+                                <input v-model="settingsData.card_letterhead_bottom" type="number" min="0" max="60" step="0.5" dir="ltr"
+                                       class="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm font-mono focus:ring-2 focus:ring-gold-500 focus:outline-none"/>
+                            </div>
+                            <p class="sm:col-span-2 text-xs text-gray-500">
+                                تحدّدان المساحة المحجوزة لترويسة ورقتك وتذييلها حتى لا يركبهما المحتوى. اضبطهما ثم احفظ الإعدادات وأعد توليد البطاقة.
+                            </p>
+                        </div>
+                    </div>
+
+                    <!-- الترويسة -->
+                    <div class="p-4 rounded-xl border border-dashed border-gray-300 bg-gray-50">
+                        <h4 class="font-bold text-sm text-gray-700 mb-2">🏞️ صورة الترويسة الافتراضية</h4>
+                        <p class="text-xs text-gray-500 mb-3">الصورة العريضة أعلى البطاقة — يمكن لكل عرض رفع ترويسة خاصة تتجاوزها</p>
+                        <div v-if="brand?.hero" class="mb-3 p-2 bg-white rounded-lg border border-gray-200">
+                            <img :src="brand.hero" alt="ترويسة البطاقات" class="max-h-24 rounded"/>
+                            <a :href="brand.hero" target="_blank" class="text-xs text-blue-600 hover:underline">فتح</a>
+                        </div>
+                        <form @submit.prevent="uploadBrand('hero')" enctype="multipart/form-data">
+                            <input ref="heroFile" type="file" accept="image/png,image/jpeg,image/webp" class="block w-full text-xs text-gray-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-blue-100 file:text-blue-700 hover:file:bg-blue-200"/>
+                            <button type="submit" class="mt-2 px-4 py-2 rounded-lg text-xs font-bold text-white bg-blue-600 hover:bg-blue-700">📤 رفع الترويسة</button>
+                        </form>
+                        <p v-if="lastBrand === 'hero' && $page.props.errors?.asset" class="mt-2 text-xs text-red-600" role="alert">{{ $page.props.errors.asset }}</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- قوالب الطباعة -->
+            <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+                <h3 class="text-lg font-bold text-gray-800 mb-4 flex items-center gap-2">🖨️ قوالب الطباعة</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <!-- قالب مالي -->
+                    <div class="p-4 rounded-xl border border-dashed border-gray-300 bg-gray-50">
+                        <h4 class="font-bold text-sm text-gray-700 mb-2">📄 القالب المالي</h4>
+                        <p class="text-xs text-gray-500 mb-3">يُستخدم لطباعة الفواتير والحوالات وسندات القبض</p>
+                        <div v-if="templates?.financial" class="mb-3 p-2 bg-green-50 rounded-lg border border-green-200">
+                            <span class="text-xs text-green-700">✅ قالب مرفوع</span>
+                            <a :href="templates.financial" target="_blank" class="text-xs text-blue-600 mr-2 hover:underline">معاينة</a>
+                        </div>
+                        <form @submit.prevent="uploadTemplate('financial')" enctype="multipart/form-data">
+                            <input ref="financialFile" type="file" accept=".pdf" class="block w-full text-xs text-gray-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-gold-100 file:text-gold-700 hover:file:bg-gold-200"/>
+                            <button type="submit" class="mt-2 px-4 py-2 rounded-lg text-xs font-bold text-white bg-gold-600 hover:bg-gold-700 disabled:opacity-50">📤 رفع القالب</button>
+                        </form>
+                    </div>
+                    <!-- قالب محاسبي -->
+                    <div class="p-4 rounded-xl border border-dashed border-gray-300 bg-gray-50">
+                        <h4 class="font-bold text-sm text-gray-700 mb-2">📊 القالب المحاسبي</h4>
+                        <p class="text-xs text-gray-500 mb-3">يُستخدم لطباعة كشف الحساب والقيود وشجرة الحسابات</p>
+                        <div v-if="templates?.accounting" class="mb-3 p-2 bg-green-50 rounded-lg border border-green-200">
+                            <span class="text-xs text-green-700">✅ قالب مرفوع</span>
+                            <a :href="templates.accounting" target="_blank" class="text-xs text-blue-600 mr-2 hover:underline">معاينة</a>
+                        </div>
+                        <form @submit.prevent="uploadTemplate('accounting')" enctype="multipart/form-data">
+                            <input ref="accountingFile" type="file" accept=".pdf" class="block w-full text-xs text-gray-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-bold file:bg-blue-100 file:text-blue-700 hover:file:bg-blue-200"/>
+                            <button type="submit" class="mt-2 px-4 py-2 rounded-lg text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50">📤 رفع القالب</button>
+                        </form>
+                    </div>
+                </div>
+                <div class="mt-4 pt-4 border-t border-gray-200">
+                    <a href="/settings/print-layout" class="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold text-sm text-white bg-purple-600 hover:bg-purple-700 shadow-md">
+                        🎨 محرر تخطيط الطباعة — تحديد مواقع العناصر بالسحب
+                    </a>
+                    <p class="text-xs text-gray-500 mt-1">حدد مكان كل عنصر على القالب بسحبه إلى الموقع المطلوب</p>
+                </div>
+            </div>
+
+            <div class="flex justify-end">
+                <button @click="saveSettings" :disabled="saving" class="px-8 py-3 rounded-xl font-bold text-sm text-black bg-gradient-to-r from-gold-500 to-gold-400 shadow-md disabled:opacity-50">💾 حفظ جميع الإعدادات</button>
+            </div>
+        </div>
+    </AppLayout>
+</template>
+<script setup>
+import { ref, reactive, computed } from 'vue';
+import { Link, router, usePage } from '@inertiajs/vue3';
+import AppLayout from '@/Components/Layout/AppLayout.vue';
+const props = defineProps({
+    settings: Object, templates: Object, brand: Object, lastBackup: Object,
+    editableKeys: { type: Array, default: () => [] },
+});
+const page = usePage();
+
+// حدود ملف واتساب للأعمال (E31) بالمحارف كما تعدّها ميتا، وشرح الحقول الجديدة
+const LIMITS = { wa_profile_about: 139, wa_profile_description: 512 };
+const lengthOf = (v) => [...String(v ?? '')].length;
+const HINTS = {
+    wa_profile_about: 'النبذة في ملف واتساب للأعمال. بلا تنسيق (* _ ` ~)، والروابط فيها لا تكون قابلة للنقر.',
+    wa_profile_description: 'الوصف في ملف واتساب للأعمال.',
+    company_website: 'يبدأ بـ https://. ملف واتساب يقبل رابطين: هذا وصفحة فيسبوك.',
+};
+
+// الحقول القابلة للتعديل من هنا فقط (الخادم يُسقط غيرها)؛ الصور تُدار من «هوية بطاقات العروض»
+// حقول ملف واتساب للأعمال (wa_profile_*) لا تُعرض والوحدة مطفأة (features.whatsapp)
+const editable = (items) => items.filter(i => i.type !== 'image' && props.editableKeys.includes(i.key)
+    && (page.props.features?.whatsapp || !i.key.startsWith('wa_profile_')));
+
+// عمر آخر نسخة احتياطية ناجحة بالساعات (null = لا نسخة بعد)
+const backupAgeHours = computed(() => {
+    const at = props.lastBackup?.at;
+    return at ? Math.floor((Date.now() - new Date(at).getTime()) / 3600000) : null;
+});
+
+const logoFile = ref(null);
+const heroFile = ref(null);
+const letterheadFile = ref(null);
+
+// رفع الشعار أو الترويسة أو الورقة الرسمية — تُحفظ في الإعدادات ويقرأها مولّد البطاقات
+// آخر نموذج رُفع منه: خطأ الرفع (صيغة أو PDF لا يُقرأ) يظهر تحته وحده
+const lastBrand = ref('');
+const uploadBrand = (type) => {
+    lastBrand.value = type;
+    const input = { logo: logoFile, hero: heroFile, letterhead: letterheadFile }[type]?.value;
+    if (!input?.files?.length) return;
+
+    const formData = new FormData();
+    formData.append('asset', input.files[0]);
+    formData.append('type', type);
+
+    router.post('/settings/brand-asset', formData, { preserveScroll: true, forceFormData: true });
+};
+
+const settingsData = reactive({});
+if (props.settings) {
+    Object.values(props.settings).flat().forEach(s => { settingsData[s.key] = s.value || ''; });
+}
+const saving = ref(false);
+const saveSettings = () => {
+    saving.value = true;
+    const payload = Object.entries(settingsData)
+        .filter(([key]) => props.editableKeys.includes(key))
+        .map(([key, value]) => ({ key, value }));
+    router.put('/settings', { settings: payload }, {
+        preserveScroll: true,
+        onFinish: () => { saving.value = false; },
+    });
+};
+
+// قوالب الطباعة
+const financialFile = ref(null);
+const accountingFile = ref(null);
+
+const uploadTemplate = (type) => {
+    const fileInput = type === 'financial' ? financialFile.value : accountingFile.value;
+    if (!fileInput?.files?.length) { alert('اختر ملف PDF أولاً'); return; }
+
+    const formData = new FormData();
+    formData.append('template', fileInput.files[0]);
+    formData.append('type', type);
+
+    router.post('/settings/upload-template', formData, {
+        preserveScroll: true,
+        forceFormData: true,
+    });
+};
+</script>

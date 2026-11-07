@@ -1,0 +1,1084 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Account;
+use App\Models\AccountingPeriod;
+use App\Models\FiscalYear;
+use App\Models\JournalEntry;
+use App\Models\JournalEntryLine;
+use App\Services\AccountingService;
+use App\Events\DataUpdated;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Inertia\Inertia;
+
+class AccountingController extends Controller
+{
+    /**
+     * شجرة الحسابات
+     */
+    public function chartOfAccounts()
+    {
+        $accounts = Account::with('childrenRecursive')
+            ->whereNull('parent_id')
+            ->orderBy('code')
+            ->get();
+
+        return Inertia::render('Accounting/ChartOfAccounts', [
+            'title' => 'شجرة الحسابات',
+            'accounts' => $accounts,
+        ]);
+    }
+
+    /**
+     * طباعة شجرة الحسابات
+     */
+    public function printChart()
+    {
+        $accounts = Account::with('childrenRecursive')
+            ->whereNull('parent_id')
+            ->orderBy('code')
+            ->get();
+
+        $template = \App\Models\Setting::where('key', 'print_template_accounting')->first();
+        $templateUrl = $template?->value ? \Illuminate\Support\Facades\Storage::url($template->value) : null;
+        $layoutSetting = \App\Models\Setting::where('key', 'print_layout_chart')->first();
+        $layout = $layoutSetting?->value ? json_decode($layoutSetting->value, true) : null;
+
+        return Inertia::render('Accounting/PrintChart', [
+            'accounts' => $accounts,
+            'templateUrl' => $templateUrl,
+            'layout' => $layout,
+        ]);
+    }
+
+    /**
+     * ميزان المراجعة
+     */
+    public function trialBalance(Request $request)
+    {
+        $from = $request->from ?? now()->startOfMonth()->toDateString();
+        $to = $request->to ?? now()->toDateString();
+
+        // الحسابات الورقية النشطة + أي حساب عليه حركة فعلية (حتى لو صار أباً أو موقوفاً)
+        // ضمّ الحسابات ذات القيود المباشرة يجعل الميزان يعكس كل قيود اليومية فلا يختلّ التوازن
+        // بسبب إعادة هيكلة شجرة الحسابات؛ والقيود الشاذّة تُبرز في لوحة التحليل أدناه.
+        $accounts = Account::where(function ($q) {
+                $q->where('is_active', true)->whereDoesntHave('children');
+            })
+            ->orWhereHas('journalLines')
+            ->orderBy('code')
+            ->get()
+            ->map(function ($account) use ($from, $to) {
+                // رصيد أول المدة
+                $openingDebit = JournalEntryLine::where('account_id', $account->id)
+                    ->join('journal_entries', 'journal_entries.id', '=', 'journal_entry_lines.journal_entry_id')
+                    ->where('journal_entries.entry_date', '<', $from)
+                    ->sum('journal_entry_lines.debit');
+
+                $openingCredit = JournalEntryLine::where('account_id', $account->id)
+                    ->join('journal_entries', 'journal_entries.id', '=', 'journal_entry_lines.journal_entry_id')
+                    ->where('journal_entries.entry_date', '<', $from)
+                    ->sum('journal_entry_lines.credit');
+
+                // حركات الفترة
+                $periodDebit = JournalEntryLine::where('account_id', $account->id)
+                    ->join('journal_entries', 'journal_entries.id', '=', 'journal_entry_lines.journal_entry_id')
+                    ->whereBetween('journal_entries.entry_date', [$from, $to . ' 23:59:59'])
+                    ->sum('journal_entry_lines.debit');
+
+                $periodCredit = JournalEntryLine::where('account_id', $account->id)
+                    ->join('journal_entries', 'journal_entries.id', '=', 'journal_entry_lines.journal_entry_id')
+                    ->whereBetween('journal_entries.entry_date', [$from, $to . ' 23:59:59'])
+                    ->sum('journal_entry_lines.credit');
+
+                // رصيد نهاية المدة
+                $closingDebit = $openingDebit + $periodDebit;
+                $closingCredit = $openingCredit + $periodCredit;
+
+                $isParent = $account->children()->exists();
+
+                return [
+                    'id' => $account->id,
+                    'code' => $account->code,
+                    'name' => $account->name,
+                    'type' => $account->type,
+                    'currency' => $account->currency,
+                    // أعلام التشخيص: صفّ شاذّ لو الحساب أب أو موقوف وعليه قيود مباشرة
+                    'is_anomaly' => $isParent || !$account->is_active,
+                    'anomaly_reason' => $isParent ? 'حساب أب عليه قيود مباشرة' : (!$account->is_active ? 'حساب موقوف عليه قيود' : null),
+                    'opening_debit' => round($openingDebit, 3),
+                    'opening_credit' => round($openingCredit, 3),
+                    'period_debit' => round($periodDebit, 3),
+                    'period_credit' => round($periodCredit, 3),
+                    'closing_debit' => round($closingDebit, 3),
+                    'closing_credit' => round($closingCredit, 3),
+                    'balance' => round($closingDebit - $closingCredit, 3),
+                ];
+            })
+            ->filter(fn ($a) => $a['closing_debit'] != 0 || $a['closing_credit'] != 0 || $a['period_debit'] != 0 || $a['period_credit'] != 0);
+
+        // ملخص النقدية (كاش vs بنك)
+        $cashAccount = Account::where('code', '1101')->first();
+        $bankAccount = Account::where('code', '1102')->first();
+        $checksAccount = Account::where('code', '1103')->first();
+
+        $cashSummary = [
+            'cash' => $cashAccount ? $cashAccount->balance : 0,
+            'bank' => $bankAccount ? $bankAccount->balance : 0,
+            'checks' => $checksAccount ? $checksAccount->balance : 0,
+        ];
+
+        return Inertia::render('Accounting/TrialBalance', [
+            'title' => 'ميزان المراجعة',
+            'accounts' => $accounts->values(),
+            'filters' => ['from' => $from, 'to' => $to],
+            'cashSummary' => $cashSummary,
+            // تحليل سلامة الميزان: القيود التي قد تكسر التوازن مع حلولها
+            'diagnostics' => \App\Services\TrialBalanceAuditor::audit(),
+        ]);
+    }
+
+    /**
+     * نقل سطر قيد من حساب (أب/موقوف/محذوف) إلى حساب ورقي نشط — لإصلاح اختلال الميزان
+     */
+    public function relocateLine(Request $request)
+    {
+        $validated = $request->validate([
+            'line_id' => 'required|exists:journal_entry_lines,id',
+            'target_account_id' => 'required|exists:accounts,id',
+        ]);
+
+        $line = JournalEntryLine::findOrFail($validated['line_id']);
+        $target = Account::findOrFail($validated['target_account_id']);
+
+        // الوجهة يجب أن تكون حساباً ورقياً نشطاً (وإلا يتكرر نفس الخلل)
+        if ($target->children()->exists()) {
+            return back()->with('error', "الحساب «{$target->code} - {$target->name}» حساب أب — اختر حساباً فرعياً (ورقياً).");
+        }
+        if (!$target->is_active) {
+            return back()->with('error', "الحساب «{$target->code} - {$target->name}» موقوف — فعّله أولاً أو اختر غيره.");
+        }
+
+        $oldAccountId = $line->account_id;
+        if ((int) $oldAccountId === (int) $target->id) {
+            return back()->with('error', 'القيد موجود بالفعل على هذا الحساب.');
+        }
+
+        DB::transaction(function () use ($line, $target, $oldAccountId) {
+            $line->update(['account_id' => $target->id]);
+
+            // مزامنة المستند المصدر إن كان سند صرف (لئلا يُعاد الترحيل على الحساب القديم عند التعديل)
+            $entry = $line->journalEntry;
+            if ($entry && $entry->reference_type === 'disbursement' && $entry->reference_id) {
+                \App\Models\Disbursement::where('id', $entry->reference_id)
+                    ->where('account_id', $oldAccountId)
+                    ->update(['account_id' => $target->id]);
+            }
+
+            // إعادة احتساب الرصيد المخبأ للحسابين المتأثرين من واقع القيود
+            foreach ([$oldAccountId, $target->id] as $accId) {
+                $acc = Account::find($accId);
+                if ($acc) {
+                    $acc->balance = $acc->calculateBalance();
+                    $acc->save();
+                }
+            }
+
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::LineRelocate, 'journal_entry_line', $line->id, $entry?->entry_number,
+                ['from_account' => (int) $oldAccountId, 'to_account' => (int) $target->id, 'amount' => (float) ($line->debit + $line->credit)]);
+        });
+
+        return back()->with('success', "تم نقل القيد إلى حساب «{$target->code} - {$target->name}» وإعادة احتساب الأرصدة بنجاح.");
+    }
+
+    /**
+     * سجل القيود
+     */
+    public function journalEntries(Request $request)
+    {
+        $entries = JournalEntry::query()
+            ->with(['lines.account:id,code,name', 'creator:id,name'])
+            ->when($request->search, fn ($q, $s) => $q->where('entry_number', 'like', "%{$s}%")
+                ->orWhere('description', 'like', "%{$s}%"))
+            ->orderByDesc('entry_date')
+            ->paginate(20)
+            ->withQueryString();
+
+        // قائمة الحسابات (الأوراق فقط) لنموذج الإضافة
+        $leafAccounts = Account::whereDoesntHave('children')
+            ->where('is_active', true)
+            ->orderBy('code')
+            ->select('id', 'code', 'name', 'type', 'currency')
+            ->get();
+
+        return Inertia::render('Accounting/JournalEntries', [
+            'title' => 'سجل القيود',
+            'entries' => $entries,
+            'filters' => $request->only(['search']),
+            'leafAccounts' => $leafAccounts,
+        ]);
+    }
+
+    // ============================================================
+    // CRUD شجرة الحسابات
+    // ============================================================
+
+    /**
+     * توليد الرقم التالي لحساب فرعي
+     */
+    private static function generateNextCode(?int $parentId): string
+    {
+        if (!$parentId) {
+            // حساب رئيسي (بدون أب): آخر رقم ألف + 1000
+            $maxRoot = Account::whereNull('parent_id')->max('code');
+            $next = $maxRoot ? intval($maxRoot) + 1000 : 1000;
+            return (string) $next;
+        }
+
+        $parent = Account::findOrFail($parentId);
+        $parentCode = $parent->code;
+        $parentLen = strlen($parentCode);
+
+        // البحث عن آخر طفل مباشر (أطفال يبدأون بكود الأب)
+        $lastChild = Account::where('parent_id', $parentId)
+            ->where('code', 'like', $parentCode . '%')
+            ->orderByDesc('code')
+            ->value('code');
+
+        if ($lastChild) {
+            // استخراج الجزء التسلسلي بعد كود الأب
+            $suffix = substr($lastChild, $parentLen);
+            $nextSuffix = intval($suffix) + 1;
+            return $parentCode . str_pad($nextSuffix, strlen($suffix), '0', STR_PAD_LEFT);
+        }
+
+        // لا يوجد أطفال: بدء بـ parent_code + "1"  (مثلاً 1102 → 11021)
+        // تحقق أولاً: إذا كان كود الأب قصير (4 أرقام أو أقل) — نضيف رقم واحد
+        return $parentCode . '1';
+    }
+
+    /**
+     * API: الرقم التالي المتاح لحساب أب معين
+     */
+    public function nextCode(Request $request)
+    {
+        $parentId = $request->parent_id ?: null;
+        $code = self::generateNextCode($parentId ? (int) $parentId : null);
+        return response()->json(['code' => $code]);
+    }
+
+    /**
+     * إضافة حساب جديد (الرقم يُولد تلقائياً)
+     */
+    public function storeAccount(Request $request)
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:150',
+            'type' => 'required|in:asset,liability,equity,revenue,expense',
+            'parent_id' => 'required|exists:accounts,id',
+            'currency' => 'required|in:JOD,SAR',
+            'description' => 'nullable|string|max:500',
+        ]);
+
+        // توليد الرقم تلقائياً
+        $validated['code'] = self::generateNextCode((int) $validated['parent_id']);
+
+        // تأكد من عدم التكرار
+        if (Account::where('code', $validated['code'])->exists()) {
+            return back()->with('error', "رقم الحساب {$validated['code']} موجود مسبقاً");
+        }
+
+        $validated['is_system'] = false;
+        $validated['is_active'] = true;
+        $validated['balance'] = 0;
+
+        $account = Account::create($validated);
+        \App\Models\AuditLog::log(\App\Enums\AuditAction::Create, 'account', $account->id, "{$account->code} - {$account->name}");
+
+        // === مزامنة مباشرة: إذا الحساب تحت "الوكلاء" (2110) — أنشئ وكيل ===
+        $parent = Account::find($validated['parent_id']);
+        $isAgentAccount = $parent && $parent->code === '2110';
+        if (!$isAgentAccount && $parent && $parent->parent_id) {
+            $grandParent = Account::find($parent->parent_id);
+            $isAgentAccount = $grandParent && $grandParent->code === '2110';
+        }
+
+        if ($isAgentAccount) {
+            $existing = \App\Models\Agent::where('account_id', $account->id)->first();
+            if (!$existing) {
+                $codes = \App\Models\Agent::withTrashed()->where('code', 'like', 'AGT-%')->pluck('code')->map(fn($c) => (int)substr($c, 4));
+                $nextNum = $codes->max() ? $codes->max() + 1 : 1;
+                \App\Models\Agent::create([
+                    'name' => $account->name,
+                    'code' => 'AGT-' . str_pad($nextNum, 3, '0', STR_PAD_LEFT),
+                    'account_id' => $account->id,
+                    'country' => 'JO',
+                    'currency' => 'JOD',
+                    'balance_sar' => 0,
+                    'is_active' => true,
+                ]);
+            }
+        }
+
+        // === مزامنة: إذا تحت "ذمم العملاء" (1200) — أنشئ عميل ===
+        if ($parent && $parent->code === '1200') {
+            $existing = \App\Models\Client::where('account_id', $account->id)->first();
+            if (!$existing) {
+                $codes = \App\Models\Client::withTrashed()->where('code', 'like', 'CLT-%')->pluck('code')->map(fn($c) => (int)substr($c, 4));
+                $nextNum = $codes->max() ? $codes->max() + 1 : 1;
+                \App\Models\Client::create([
+                    'name' => $account->name,
+                    'code' => 'CLT-' . str_pad($nextNum, 3, '0', STR_PAD_LEFT),
+                    'account_id' => $account->id,
+                    'country' => 'JO',
+                    'currency' => 'JOD',
+                    'balance_jod' => 0,
+                    'credit_limit_jod' => 0,
+                    'is_active' => true,
+                ]);
+            }
+        }
+
+        event(new DataUpdated('account', 'created', $account->id));
+
+        // تحذير وقائي: لو الأب عليه قيود مباشرة سابقة، صار الآن حساباً أباً
+        // فستظهر تلك القيود كحالات شاذّة في ميزان المراجعة حتى تُنقل إلى الفروع
+        $parentHasDirectEntries = JournalEntryLine::where('account_id', $validated['parent_id'])->exists();
+        if ($parentHasDirectEntries && $parent) {
+            return redirect()->back()->with('success',
+                "تم إضافة الحساب بنجاح. ⚠️ تنبيه: الحساب الأب «{$parent->code} - {$parent->name}» عليه قيود مباشرة سابقة؛ " .
+                "افتح «ميزان المراجعة ← تحليل سلامة الميزان» وانقل تلك القيود إلى الفروع المناسبة حتى يبقى الميزان متوازناً.");
+        }
+
+        return redirect()->back()->with('success', 'تم إضافة الحساب بنجاح');
+    }
+
+    /**
+     * تعديل حساب
+     */
+    public function updateAccount(Request $request, Account $account)
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:150',
+            'type' => 'required|in:asset,liability,equity,revenue,expense',
+            'parent_id' => 'nullable|exists:accounts,id',
+            'currency' => 'required|in:JOD,SAR',
+            'description' => 'nullable|string|max:500',
+            'is_active' => 'boolean',
+        ]);
+
+        // لا يمكن تعديل كود الحسابات الثابتة
+        if (!$account->is_system) {
+            $codeValidation = $request->validate([
+                'code' => 'required|string|max:20|unique:accounts,code,' . $account->id,
+            ]);
+            $validated['code'] = $codeValidation['code'];
+        }
+
+        DB::transaction(function () use ($account, $validated) {
+            $account->fill($validated);
+            $changed = array_keys($account->getDirty());
+            $account->save();
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::Update, 'account', $account->id, "{$account->code} - {$account->name}", ['changed' => $changed]);
+        });
+
+        return redirect()->back()->with('success', 'تم تحديث الحساب بنجاح');
+    }
+
+    /**
+     * حذف حساب (فقط غير الثابتة وبدون قيود)
+     */
+    public function destroyAccount(Account $account)
+    {
+        if ($account->is_system) {
+            return back()->with('error', 'لا يمكن حذف حساب من حسابات النظام الأساسية');
+        }
+
+        if ($account->children()->count() > 0) {
+            return back()->with('error', 'لا يمكن حذف حساب لديه حسابات فرعية');
+        }
+
+        $hasEntries = JournalEntryLine::where('account_id', $account->id)->exists();
+        if ($hasEntries) {
+            return back()->with('error', 'لا يمكن حذف حساب لديه قيود محاسبية مسجلة');
+        }
+
+        DB::transaction(function () use ($account) {
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::Delete, 'account', $account->id, "{$account->code} - {$account->name}");
+            $account->delete();
+        });
+        return redirect()->back()->with('success', 'تم حذف الحساب بنجاح');
+    }
+
+    // ============================================================
+    // القيود اليدوية
+    // ============================================================
+
+    /**
+     * إنشاء قيد يدوي
+     */
+    public function storeJournal(Request $request)
+    {
+        $validated = $request->validate([
+            'description' => 'required|string|max:500',
+            'entry_date' => 'nullable|date',
+            'lines' => 'required|array|min:2',
+            'lines.*.account_id' => 'required|exists:accounts,id',
+            'lines.*.debit' => 'required|numeric|min:0',
+            'lines.*.credit' => 'required|numeric|min:0',
+            'lines.*.description' => 'nullable|string|max:255',
+        ]);
+
+        // التحقق من التوازن
+        $totalDebit = collect($validated['lines'])->sum('debit');
+        $totalCredit = collect($validated['lines'])->sum('credit');
+
+        if (round($totalDebit, 3) !== round($totalCredit, 3)) {
+            return back()->with('error', "القيد غير متوازن — مدين: {$totalDebit} ≠ دائن: {$totalCredit}");
+        }
+
+        if ($totalDebit == 0) {
+            return back()->with('error', 'القيد لا يحتوي على أي مبلغ');
+        }
+
+        // التحقق من أن كل سطر له مدين أو دائن (وليس كلاهما)
+        foreach ($validated['lines'] as $i => $line) {
+            if ($line['debit'] > 0 && $line['credit'] > 0) {
+                return back()->with('error', 'لا يمكن أن يكون نفس السطر مديناً ودائناً في نفس الوقت');
+            }
+            if ($line['debit'] == 0 && $line['credit'] == 0) {
+                return back()->with('error', 'كل سطر يجب أن يحتوي على مبلغ مدين أو دائن');
+            }
+        }
+
+        DB::transaction(function () use ($validated, $totalDebit, $totalCredit) {
+            // التحقق من الفترة المحاسبية
+            $entryDate = $validated['entry_date'] ?? now()->toDateString();
+            if (AccountingPeriod::isDateLocked($entryDate)) {
+                throw new \Exception('الفترة مقفلة');
+            }
+
+            // توليد رقم القيد
+            $today = now()->format('Ymd');
+            $last = JournalEntry::where('entry_number', 'like', "JRN-{$today}-%")
+                ->lockForUpdate()
+                ->orderByDesc('entry_number')->value('entry_number');
+            $seq = $last ? (int) substr($last, -4) + 1 : 1;
+            $entryNumber = "JRN-{$today}-" . str_pad($seq, 4, '0', STR_PAD_LEFT);
+
+            $entry = JournalEntry::create([
+                'entry_number' => $entryNumber,
+                'entry_date' => $entryDate,
+                'description' => $validated['description'],
+                'reference_type' => 'manual',
+                'reference_id' => null,
+                'total_debit' => $totalDebit,
+                'total_credit' => $totalCredit,
+                'created_by' => auth()->id(),
+            ]);
+
+            foreach ($validated['lines'] as $line) {
+                $entry->lines()->create([
+                    'account_id' => $line['account_id'],
+                    'debit' => $line['debit'],
+                    'credit' => $line['credit'],
+                    'description' => $line['description'] ?? null,
+                ]);
+
+                // تحديث رصيد الحساب
+                $account = Account::find($line['account_id']);
+                if ($account) {
+                    $d = $line['debit'];
+                    $c = $line['credit'];
+                    if (in_array($account->type, ['asset', 'expense'])) {
+                        $account->increment('balance', $d - $c);
+                    } else {
+                        $account->increment('balance', $c - $d);
+                    }
+                }
+            }
+
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::Create, 'journal_entry', $entry->id, $entry->entry_number, ['total' => (float) $totalDebit, 'lines' => count($validated['lines'])]);
+        });
+
+        return redirect()->back()->with('success', 'تم إنشاء القيد اليدوي بنجاح');
+    }
+
+    /**
+     * تعديل قيد يومية يدوي (فقط manual وغير معكوس وفترة غير مقفلة).
+     * يعكس أثر السطور القديمة على الأرصدة، ثم يستبدلها بالجديدة ضمن transaction واحدة.
+     */
+    public function updateJournal(Request $request, JournalEntry $entry)
+    {
+        if ($entry->reference_type !== 'manual') {
+            return back()->with('error', 'لا يمكن تعديل إلا القيود اليدوية. القيود المُولّدة من النظام تُعدّل من مصدرها أو تُعكس.');
+        }
+        if ($entry->is_reversed) {
+            return back()->with('error', 'لا يمكن تعديل قيد تم عكسه.');
+        }
+
+        $validated = $request->validate([
+            'description' => 'required|string|max:500',
+            'entry_date' => 'nullable|date',
+            'lines' => 'required|array|min:2',
+            'lines.*.account_id' => 'required|exists:accounts,id',
+            'lines.*.debit' => 'required|numeric|min:0',
+            'lines.*.credit' => 'required|numeric|min:0',
+            'lines.*.description' => 'nullable|string|max:255',
+        ]);
+
+        $totalDebit = collect($validated['lines'])->sum('debit');
+        $totalCredit = collect($validated['lines'])->sum('credit');
+
+        if (round($totalDebit, 3) !== round($totalCredit, 3)) {
+            return back()->with('error', "القيد غير متوازن — مدين: {$totalDebit} ≠ دائن: {$totalCredit}");
+        }
+        if ($totalDebit == 0) {
+            return back()->with('error', 'القيد لا يحتوي على أي مبلغ');
+        }
+        foreach ($validated['lines'] as $line) {
+            if ($line['debit'] > 0 && $line['credit'] > 0) {
+                return back()->with('error', 'لا يمكن أن يكون نفس السطر مديناً ودائناً في نفس الوقت');
+            }
+            if ($line['debit'] == 0 && $line['credit'] == 0) {
+                return back()->with('error', 'كل سطر يجب أن يحتوي على مبلغ مدين أو دائن');
+            }
+        }
+
+        $newDate = $validated['entry_date'] ?? $entry->entry_date->toDateString();
+        if (AccountingPeriod::isDateLocked($entry->entry_date->toDateString()) || AccountingPeriod::isDateLocked($newDate)) {
+            return back()->with('error', 'لا يمكن التعديل ضمن فترة محاسبية مقفلة');
+        }
+
+        DB::transaction(function () use ($entry, $validated, $totalDebit, $totalCredit, $newDate) {
+            $entry->load('lines');
+
+            // 1) عكس أثر السطور القديمة على الرصيد المخبأ
+            foreach ($entry->lines as $old) {
+                $acc = Account::find($old->account_id);
+                if ($acc) {
+                    $delta = in_array($acc->type, ['asset', 'expense'])
+                        ? ($old->debit - $old->credit)
+                        : ($old->credit - $old->debit);
+                    $acc->decrement('balance', $delta);
+                }
+            }
+
+            // 2) حذف السطور القديمة
+            $entry->lines()->delete();
+
+            // 3) تحديث رأس القيد + إدراج السطور الجديدة وتطبيق أثرها
+            $entry->update([
+                'entry_date' => $newDate,
+                'description' => $validated['description'],
+                'total_debit' => $totalDebit,
+                'total_credit' => $totalCredit,
+            ]);
+
+            foreach ($validated['lines'] as $line) {
+                $entry->lines()->create([
+                    'account_id' => $line['account_id'],
+                    'debit' => $line['debit'],
+                    'credit' => $line['credit'],
+                    'description' => $line['description'] ?? null,
+                ]);
+                $acc = Account::find($line['account_id']);
+                if ($acc) {
+                    $d = $line['debit'];
+                    $c = $line['credit'];
+                    $delta = in_array($acc->type, ['asset', 'expense']) ? ($d - $c) : ($c - $d);
+                    $acc->increment('balance', $delta);
+                }
+            }
+
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::Update, 'journal_entry', $entry->id, $entry->entry_number, ['total' => (float) $totalDebit, 'lines' => count($validated['lines'])]);
+        });
+
+        return redirect()->back()->with('success', "تم تعديل القيد {$entry->entry_number} بنجاح");
+    }
+
+    /**
+     * حذف قيد يومية يدوي (فقط manual وغير معكوس وفترة غير مقفلة).
+     * يعكس أثر السطور على الأرصدة المخبأة ثم يحذف السطور والقيد نهائياً — ضمن transaction واحدة.
+     * القيود المُولّدة من النظام (فاتورة/سند/مصروف/عكس/إقفال) محميّة ولا تُحذف من هنا.
+     */
+    public function destroyJournal(JournalEntry $entry)
+    {
+        if ($entry->reference_type !== 'manual') {
+            return back()->with('error', 'لا يمكن حذف إلا القيود اليدوية. القيود المُولّدة من النظام تُدار من مصدرها أو تُعكس.');
+        }
+        if ($entry->is_reversed) {
+            return back()->with('error', 'لا يمكن حذف قيد تم عكسه — القيد العكسي يوثّق الإلغاء.');
+        }
+        if (AccountingPeriod::isDateLocked($entry->entry_date->toDateString())) {
+            return back()->with('error', 'لا يمكن حذف قيد ضمن فترة محاسبية مقفلة');
+        }
+
+        $entryNumber = $entry->entry_number;
+
+        DB::transaction(function () use ($entry, $entryNumber) {
+            $entry->load('lines');
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::Delete, 'journal_entry', $entry->id, $entryNumber, ['total' => (float) $entry->total_debit, 'lines' => $entry->lines->count()]);
+
+            // عكس أثر السطور على الرصيد المخبأ (نفس منطق تعديل القيد)
+            foreach ($entry->lines as $line) {
+                $acc = Account::find($line->account_id);
+                if ($acc) {
+                    $delta = in_array($acc->type, ['asset', 'expense'])
+                        ? ($line->debit - $line->credit)
+                        : ($line->credit - $line->debit);
+                    $acc->decrement('balance', $delta);
+                }
+            }
+
+            // حذف نهائي للسطور ثم القيد (لا SoftDeletes على النموذجين) — يزيلها من الميزان والكشوف
+            $entry->lines()->delete();
+            $entry->delete();
+        });
+
+        return back()->with('success', "تم حذف القيد {$entryNumber} وعكس أثره على الأرصدة بنجاح");
+    }
+
+    // ============================================================
+    // عكس القيود
+    // ============================================================
+
+    public function reverseEntry(JournalEntry $entry)
+    {
+        try {
+            $reversal = DB::transaction(function () use ($entry) {
+                $reversal = AccountingService::reverseEntry($entry, 'عكس يدوي');
+                \App\Models\AuditLog::log(\App\Enums\AuditAction::Reverse, 'journal_entry', $entry->id, $entry->entry_number, ['reversal' => $reversal->entry_number, 'total' => (float) $entry->total_debit]);
+
+                return $reversal;
+            });
+            return back()->with('success', "تم عكس القيد — القيد العكسي: {$reversal->entry_number}");
+        } catch (\Exception $e) {
+            return back()->with('error', $e->getMessage());
+        }
+    }
+
+    // ============================================================
+    // الفترات المحاسبية
+    // ============================================================
+
+    public function periods()
+    {
+        $periods = AccountingPeriod::orderByDesc('year')->orderByDesc('month')->get();
+        $years = JournalEntry::selectRaw("strftime('%Y', entry_date) as year")
+            ->groupBy('year')->orderByDesc('year')->pluck('year');
+        $fiscalYears = FiscalYear::orderByDesc('year')->get();
+
+        return Inertia::render('Accounting/Periods', [
+            'title' => 'الفترات المحاسبية',
+            'periods' => $periods,
+            'availableYears' => $years,
+            'fiscalYears' => $fiscalYears,
+        ]);
+    }
+
+    public function storeFiscalYear(Request $request)
+    {
+        $validated = $request->validate([
+            'year' => 'required|integer|min:2020|max:2099|unique:fiscal_years,year',
+            'start_date' => 'required|date',
+            'end_date' => 'required|date|after:start_date',
+            'notes' => 'nullable|string|max:500',
+        ]);
+
+        $validated['created_by'] = auth()->id();
+        $fiscalYear = FiscalYear::create($validated);
+        \App\Models\AuditLog::log(\App\Enums\AuditAction::Create, 'fiscal_year', $fiscalYear->id, (string) $validated['year']);
+
+        return back()->with('success', "تم إنشاء السنة المالية {$validated['year']} بنجاح");
+    }
+
+    public function destroyFiscalYear(FiscalYear $fiscalYear)
+    {
+        if ($fiscalYear->isClosed()) {
+            return back()->with('error', 'لا يمكن حذف سنة مالية مقفلة');
+        }
+
+        DB::transaction(function () use ($fiscalYear) {
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::Delete, 'fiscal_year', $fiscalYear->id, (string) $fiscalYear->year);
+            $fiscalYear->delete();
+        });
+        return back()->with('success', 'تم حذف السنة المالية');
+    }
+
+    public function closePeriod(Request $request)
+    {
+        abort_unless(auth()->user()->can('accounting.close'), 403);
+
+        $validated = $request->validate([
+            'year' => 'required|integer|min:2020|max:2099',
+            'month' => 'required|integer|min:0|max:12',
+        ]);
+
+        $label = $validated['month'] == 0
+            ? "السنة {$validated['year']} كاملة"
+            : "شهر {$validated['month']}/{$validated['year']}";
+
+        DB::transaction(function () use ($validated, $label) {
+            $period = AccountingPeriod::updateOrCreate(
+                ['year' => $validated['year'], 'month' => $validated['month']],
+                [
+                    'status' => 'closed',
+                    'closed_by' => auth()->id(),
+                    'closed_at' => now(),
+                ]
+            );
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::PeriodClose, 'accounting_period', $period->id, $label);
+        });
+
+        return back()->with('success', "تم إقفال {$label}");
+    }
+
+    public function openPeriod(Request $request)
+    {
+        abort_unless(auth()->user()->can('accounting.close'), 403);
+
+        $validated = $request->validate([
+            'year' => 'required|integer',
+            'month' => 'required|integer|min:0|max:12',
+        ]);
+
+        DB::transaction(function () use ($validated) {
+            $period = AccountingPeriod::where('year', $validated['year'])->where('month', $validated['month'])->first();
+            AccountingPeriod::where('year', $validated['year'])
+                ->where('month', $validated['month'])
+                ->update(['status' => 'open', 'closed_by' => null, 'closed_at' => null]);
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::PeriodOpen, 'accounting_period', $period?->id, "{$validated['month']}/{$validated['year']}");
+        });
+
+        return back()->with('success', 'تم فتح الفترة');
+    }
+
+    // ============================================================
+    // إقفال السنة المالية
+    // ============================================================
+
+    public function closeYear(Request $request)
+    {
+        abort_unless(auth()->user()->can('accounting.close'), 403);
+
+        $validated = $request->validate(['year' => 'required|integer|min:2020|max:2099']);
+
+        try {
+            $result = DB::transaction(function () use ($validated) {
+                $result = AccountingService::closeYear($validated['year']);
+                \App\Models\AuditLog::log(\App\Enums\AuditAction::YearClose, 'fiscal_year', null, (string) $validated['year'], ['net_income' => (float) $result['net_income'], 'entry' => $result['entry']->entry_number]);
+
+                return $result;
+            });
+            return back()->with('success',
+                "تم إقفال السنة {$validated['year']} — صافي الربح: " .
+                number_format($result['net_income'], 3) . ' JOD — قيد: ' .
+                $result['entry']->entry_number
+            );
+        } catch (\Exception $e) {
+            return back()->with('error', $e->getMessage());
+        }
+    }
+
+    // ============================================================
+    // التقارير المالية
+    // ============================================================
+
+    public function profitAndLoss(Request $request)
+    {
+        $from = $request->from ?? now()->startOfYear()->toDateString();
+        $to = $request->to ?? now()->toDateString();
+
+        $report = AccountingService::profitAndLoss($from, $to);
+
+        return Inertia::render('Accounting/ProfitAndLoss', [
+            'title' => 'قائمة الدخل',
+            'report' => $report,
+            'filters' => ['from' => $from, 'to' => $to],
+        ]);
+    }
+
+    public function balanceSheet(Request $request)
+    {
+        $asOfDate = $request->as_of ?? now()->toDateString();
+
+        $report = AccountingService::balanceSheet($asOfDate);
+
+        return Inertia::render('Accounting/BalanceSheet', [
+            'title' => 'الميزانية العمومية',
+            'report' => $report,
+            'filters' => ['as_of' => $asOfDate],
+        ]);
+    }
+
+    /**
+     * تفاصيل حساب — كل العمليات المرتبطة
+     */
+    public function accountDetails(Request $request, Account $account)
+    {
+        $from = $request->from ?? now()->startOfMonth()->toDateString();
+        $to = $request->to ?? now()->toDateString();
+
+        $lines = JournalEntryLine::where('account_id', $account->id)
+            ->join('journal_entries', 'journal_entries.id', '=', 'journal_entry_lines.journal_entry_id')
+            ->liveEntries()
+            ->whereBetween('journal_entries.entry_date', [$from, $to . ' 23:59:59'])
+            ->orderBy('journal_entries.entry_date')
+            ->orderBy('journal_entries.id')
+            ->select(
+                'journal_entry_lines.*',
+                'journal_entries.entry_number',
+                'journal_entries.entry_date',
+                'journal_entries.description as entry_description',
+                'journal_entries.reference_type',
+                'journal_entries.reference_id',
+                'journal_entries.is_reversed',
+            )
+            ->get();
+
+        // حساب الرصيد الافتتاحي — بنفس فلتر الحركات وإلّا اختلّ التراكم
+        $openingDebit = JournalEntryLine::where('account_id', $account->id)
+            ->join('journal_entries', 'journal_entries.id', '=', 'journal_entry_lines.journal_entry_id')
+            ->liveEntries()
+            ->where('journal_entries.entry_date', '<', $from)
+            ->sum('journal_entry_lines.debit');
+        $openingCredit = JournalEntryLine::where('account_id', $account->id)
+            ->join('journal_entries', 'journal_entries.id', '=', 'journal_entry_lines.journal_entry_id')
+            ->liveEntries()
+            ->where('journal_entries.entry_date', '<', $from)
+            ->sum('journal_entry_lines.credit');
+
+        $openingBalance = in_array($account->type, ['asset', 'expense'])
+            ? $openingDebit - $openingCredit
+            : $openingCredit - $openingDebit;
+
+        // تحميل ملاحظات العمليات المرتبطة
+        $referenceGroups = $lines->groupBy('reference_type');
+        $notesMap = [];
+
+        foreach ($referenceGroups as $type => $group) {
+            $ids = $group->pluck('reference_id')->filter()->unique()->values()->toArray();
+            if (empty($ids)) continue;
+
+            $modelClass = match ($type) {
+                'invoice' => \App\Models\Invoice::class,
+                'receipt' => \App\Models\Receipt::class,
+                'transfer' => \App\Models\Transfer::class,
+                'expense' => \App\Models\Expense::class,
+                'disbursement' => \App\Models\Disbursement::class,
+                default => null,
+            };
+
+            if ($modelClass) {
+                $records = $modelClass::whereIn('id', $ids)->select('id', 'notes')->get();
+                foreach ($records as $record) {
+                    $notesMap["{$type}_{$record->id}"] = $record->notes;
+                }
+            }
+        }
+
+        foreach ($lines as $line) {
+            $key = "{$line->reference_type}_{$line->reference_id}";
+            $line->reference_notes = $notesMap[$key] ?? null;
+        }
+
+        return Inertia::render('Accounting/AccountDetails', [
+            'title' => "كشف حساب: {$account->code} - {$account->name}",
+            'account' => [
+                'id' => $account->id,
+                'code' => $account->code,
+                'name' => $account->name,
+                'type' => $account->type,
+                'currency' => $account->currency,
+                'balance' => $account->balance,
+            ],
+            'opening_balance' => round($openingBalance, 3),
+            'lines' => $lines,
+            'totals' => [
+                'debit' => round($lines->sum('debit'), 3),
+                'credit' => round($lines->sum('credit'), 3),
+            ],
+            'filters' => ['from' => $from, 'to' => $to],
+        ]);
+    }
+
+    /**
+     * طباعة كشف حساب محاسبي
+     */
+    public function printAccountDetails(Request $request, Account $account)
+    {
+        $from = $request->from ?? now()->startOfMonth()->toDateString();
+        $to = $request->to ?? now()->toDateString();
+
+        // الحركات الملغاة بالتعديل لا تُطبع: القيد المعكوس وقيد عكسه معاً
+        $lines = JournalEntryLine::where('account_id', $account->id)
+            ->whereHas('journalEntry', fn ($q) => $q->live()->whereBetween('entry_date', [$from, $to . ' 23:59:59']))
+            ->with('journalEntry')
+            ->get()
+            ->map(fn ($l) => [
+                'entry_date' => $l->journalEntry->entry_date,
+                'entry_number' => $l->journalEntry->entry_number,
+                'description' => $l->description ?: $l->journalEntry->description,
+                'reference_type' => $l->journalEntry->reference_type,
+                'reference_id' => $l->journalEntry->reference_id,
+                'debit' => $l->debit,
+                'credit' => $l->credit,
+            ])
+            ->sortBy('entry_date')->values();
+
+        // تحميل ملاحظات العمليات المرتبطة
+        $referenceGroups = $lines->groupBy('reference_type');
+        $notesMap = [];
+
+        foreach ($referenceGroups as $type => $group) {
+            $ids = $group->pluck('reference_id')->filter()->unique()->values()->toArray();
+            if (empty($ids)) continue;
+
+            $modelClass = match ($type) {
+                'invoice' => \App\Models\Invoice::class,
+                'receipt' => \App\Models\Receipt::class,
+                'transfer' => \App\Models\Transfer::class,
+                'expense' => \App\Models\Expense::class,
+                'disbursement' => \App\Models\Disbursement::class,
+                default => null,
+            };
+
+            if ($modelClass) {
+                $records = $modelClass::whereIn('id', $ids)->select('id', 'notes')->get();
+                foreach ($records as $record) {
+                    $notesMap["{$type}_{$record->id}"] = $record->notes;
+                }
+            }
+        }
+
+        $lines = $lines->map(function ($line) use ($notesMap) {
+            $key = "{$line['reference_type']}_{$line['reference_id']}";
+            $line['reference_notes'] = $notesMap[$key] ?? null;
+            return $line;
+        });
+
+        // الافتتاحي يُفلتَر بنفس القاعدة، وإلّا حُسبت فاتورة عُدّلت لاحقاً مرّتين:
+        // مرّة بقيمتها القديمة في الافتتاحي، ومرّة بقيمتها الجديدة داخل الفترة.
+        $openingBalance = JournalEntryLine::where('account_id', $account->id)
+            ->whereHas('journalEntry', fn ($q) => $q->live()->where('entry_date', '<', $from))
+            ->sum(DB::raw('debit - credit'));
+
+        $template = \App\Models\Setting::where('key', 'print_template_accounting')->first();
+        $templateUrl = $template?->value ? \Illuminate\Support\Facades\Storage::url($template->value) : null;
+        $layoutSetting = \App\Models\Setting::where('key', 'print_layout_statement')->first();
+        $layout = $layoutSetting?->value ? json_decode($layoutSetting->value, true) : null;
+
+        return Inertia::render('Accounting/PrintStatement', [
+            'account' => $account,
+            'entries' => $lines,
+            'openingBalance' => round($openingBalance, 3),
+            'filters' => ['from' => $from, 'to' => $to],
+            'templateUrl' => $templateUrl,
+            'layout' => $layout,
+        ]);
+    }
+
+    /**
+     * طباعة ميزان المراجعة
+     */
+    public function printTrialBalance(Request $request)
+    {
+        $from = $request->from ?? now()->startOfYear()->toDateString();
+        $to = $request->to ?? now()->toDateString();
+
+        $accounts = Account::whereDoesntHave('childrenRecursive')->orderBy('code')->get();
+        $result = $accounts->map(function ($a) use ($from, $to) {
+            $openingLines = $a->journalLines()->whereHas('journalEntry', fn ($q) => $q->where('entry_date', '<', $from))->get();
+            $periodLines = $a->journalLines()->whereHas('journalEntry', fn ($q) => $q->whereBetween('entry_date', [$from, $to . ' 23:59:59']))->get();
+            $od = $openingLines->sum('debit'); $oc = $openingLines->sum('credit');
+            $pd = $periodLines->sum('debit'); $pc = $periodLines->sum('credit');
+            return [
+                'id' => $a->id, 'code' => $a->code, 'name' => $a->name,
+                'opening_debit' => max(0, $od - $oc), 'opening_credit' => max(0, $oc - $od),
+                'period_debit' => $pd, 'period_credit' => $pc,
+                'closing_debit' => max(0, ($od + $pd) - ($oc + $pc)),
+                'closing_credit' => max(0, ($oc + $pc) - ($od + $pd)),
+            ];
+        })->filter(fn ($a) => $a['opening_debit'] > 0 || $a['opening_credit'] > 0 || $a['period_debit'] > 0 || $a['period_credit'] > 0);
+
+        $template = \App\Models\Setting::where('key', 'print_template_accounting')->first();
+        $templateUrl = $template?->value ? \Illuminate\Support\Facades\Storage::url($template->value) : null;
+        $layoutSetting = \App\Models\Setting::where('key', 'print_layout_trial_balance')->first();
+        $layout = $layoutSetting?->value ? json_decode($layoutSetting->value, true) : null;
+
+        return Inertia::render('Accounting/PrintTrialBalance', [
+            'accounts' => $result->values(),
+            'filters' => ['from' => $from, 'to' => $to],
+            'templateUrl' => $templateUrl,
+            'layout' => $layout,
+        ]);
+    }
+
+    /**
+     * طباعة الأرباح والخسائر
+     */
+    public function printProfitLoss(Request $request)
+    {
+        $from = $request->from ?? now()->startOfYear()->toDateString();
+        $to = $request->to ?? now()->toDateString();
+
+        $revenues = Account::where('type', 'revenue')->whereDoesntHave('childrenRecursive')->orderBy('code')->get()
+            ->map(fn ($a) => ['code' => $a->code, 'name' => $a->name, 'amount' => $a->journalLines()->whereHas('journalEntry', fn ($q) => $q->whereBetween('entry_date', [$from, $to . ' 23:59:59']))->sum(DB::raw('credit - debit'))])
+            ->filter(fn ($a) => abs($a['amount']) > 0.001);
+        $expenses = Account::where('type', 'expense')->whereDoesntHave('childrenRecursive')->orderBy('code')->get()
+            ->map(fn ($a) => ['code' => $a->code, 'name' => $a->name, 'amount' => $a->journalLines()->whereHas('journalEntry', fn ($q) => $q->whereBetween('entry_date', [$from, $to . ' 23:59:59']))->sum(DB::raw('debit - credit'))])
+            ->filter(fn ($a) => abs($a['amount']) > 0.001);
+
+        $template = \App\Models\Setting::where('key', 'print_template_accounting')->first();
+        $templateUrl = $template?->value ? \Illuminate\Support\Facades\Storage::url($template->value) : null;
+        $layoutSetting = \App\Models\Setting::where('key', 'print_layout_profit_loss')->first();
+        $layout = $layoutSetting?->value ? json_decode($layoutSetting->value, true) : null;
+
+        return Inertia::render('Accounting/PrintProfitLoss', [
+            'revenues' => $revenues->values(),
+            'expenses' => $expenses->values(),
+            'totalRevenue' => $revenues->sum('amount'),
+            'totalExpenses' => $expenses->sum('amount'),
+            'netIncome' => $revenues->sum('amount') - $expenses->sum('amount'),
+            'filters' => ['from' => $from, 'to' => $to],
+            'templateUrl' => $templateUrl,
+            'layout' => $layout,
+        ]);
+    }
+
+    /**
+     * طباعة الميزانية العمومية
+     */
+    public function printBalanceSheet(Request $request)
+    {
+        $asOf = $request->as_of ?? now()->toDateString();
+
+        $getAccounts = fn ($type) => Account::where('type', $type)->whereDoesntHave('childrenRecursive')->orderBy('code')->get()
+            ->map(fn ($a) => ['code' => $a->code, 'name' => $a->name, 'balance' => $a->journalLines()->whereHas('journalEntry', fn ($q) => $q->where('entry_date', '<=', $asOf . ' 23:59:59'))->sum(DB::raw($type === 'asset' || $type === 'expense' ? 'debit - credit' : 'credit - debit'))])
+            ->filter(fn ($a) => abs($a['balance']) > 0.001);
+
+        $assets = $getAccounts('asset');
+        $liabilities = $getAccounts('liability');
+        $equity = $getAccounts('equity');
+
+        $template = \App\Models\Setting::where('key', 'print_template_accounting')->first();
+        $templateUrl = $template?->value ? \Illuminate\Support\Facades\Storage::url($template->value) : null;
+        $layoutSetting = \App\Models\Setting::where('key', 'print_layout_balance_sheet')->first();
+        $layout = $layoutSetting?->value ? json_decode($layoutSetting->value, true) : null;
+
+        return Inertia::render('Accounting/PrintBalanceSheet', [
+            'assets' => $assets->values(),
+            'liabilities' => $liabilities->values(),
+            'equity' => $equity->values(),
+            'totalAssets' => $assets->sum('balance'),
+            'totalLiabilities' => $liabilities->sum('balance'),
+            'totalEquity' => $equity->sum('balance'),
+            'filters' => ['as_of' => $asOf],
+            'templateUrl' => $templateUrl,
+            'layout' => $layout,
+        ]);
+    }
+}

@@ -1,0 +1,84 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\FcmToken;
+use App\Services\PushService;
+use Illuminate\Http\Request;
+
+class FcmTokenController extends Controller
+{
+    /**
+     * Store or update an FCM token for the authenticated user.
+     */
+    public function store(Request $request)
+    {
+        $request->validate([
+            'token' => 'required|string',
+            'device_type' => 'nullable|in:android,ios,web,windows,macos',
+        ]);
+
+        // التوكن يخصّ الجهاز لا المستخدم: إن سجّل غيره الدخول على نفس الجهاز ينتقل إليه
+        // (التوكن فريد في الجدول — والبحث داخل علاقة المستخدم كان يصطدم بالقيد)
+        $token = FcmToken::updateOrCreate(
+            ['token' => $request->token],
+            [
+                'user_id' => $request->user()->id,
+                'device_type' => $request->device_type ?? 'web',
+                'last_used_at' => now(),
+            ]
+        );
+
+        return response()->json([
+            'message' => 'FCM token registered successfully.',
+            'data' => $token
+        ]);
+    }
+
+    /**
+     * إشعار تجريبي لهذا الجهاز وحده — فوراً لا في الطابور، ليرى المستخدم سبب الفشل إن فشل.
+     */
+    public function test(Request $request)
+    {
+        $request->validate([
+            'token' => 'required|string',
+        ]);
+
+        if (!$request->user()->fcmTokens()->where('token', $request->token)->exists()) {
+            return response()->json(['message' => 'هذا الجهاز غير مسجّل لحسابك — اضغط «إعادة المحاولة».'], 404);
+        }
+        if (!PushService::configured()) {
+            return response()->json(['message' => 'ملف حساب خدمة Firebase غير موجود على الخادم (FIREBASE_CREDENTIALS).'], 503);
+        }
+
+        try {
+            $report = PushService::toTokens([$request->token], 'إشعار تجريبي', 'إشعارات هذا الجهاز تعمل ✅', '/', 'push-test');
+        } catch (\Throwable $e) {
+            report($e);
+            return response()->json(['message' => 'تعذّر الاتصال بـ Firebase: ' . $e->getMessage()], 502);
+        }
+
+        $failure = $report->failures()->getItems()[0] ?? null;
+        if ($failure) {
+            return response()->json(['message' => 'رفض Firebase الإرسال: ' . ($failure->error()?->getMessage() ?? 'سبب غير معروف')], 422);
+        }
+
+        return response()->json(['message' => 'أُرسل الإشعار التجريبي.']);
+    }
+
+    /**
+     * Remove an FCM token.
+     */
+    public function destroy(Request $request)
+    {
+        $request->validate([
+            'token' => 'required|string',
+        ]);
+
+        $request->user()->fcmTokens()->where('token', $request->token)->delete();
+
+        return response()->json([
+            'message' => 'FCM token removed successfully.'
+        ]);
+    }
+}

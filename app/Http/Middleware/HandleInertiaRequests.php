@@ -1,0 +1,63 @@
+<?php
+
+namespace App\Http\Middleware;
+
+use Illuminate\Http\Request;
+use Inertia\Middleware;
+
+class HandleInertiaRequests extends Middleware
+{
+    protected $rootView = 'app';
+
+    public function share(Request $request): array
+    {
+        $user = $request->user();
+
+        return array_merge(parent::share($request), [
+            'auth' => [
+                'user' => $user ? [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'avatar' => $user->avatar,
+                    'locale' => $user->locale ?? 'ar',
+                    'theme' => $user->theme ?? 'light',
+                    'role' => $user->role ? [
+                        'id' => $user->role->id,
+                        'name' => $user->role->name,
+                        'slug' => $user->role->slug,
+                    ] : null,
+                ] : null,
+                'isAdmin' => $user?->isAdmin() ?? false,
+                'permissions' => $user?->role?->permissions?->pluck('slug')->toArray() ?? [],
+            ],
+            'flash' => [
+                'success' => fn () => $request->session()->get('success'),
+                'error' => fn () => $request->session()->get('error'),
+                // E27: فعل حساس رُدّ لانتهاء نافذة التحقق المعزّز؛ نافذة التأكيد تعيده بعد النجاح
+                'stepup_required' => fn () => (bool) $request->session()->get('stepup_required'),
+            ],
+            // E27: شريط «فعّل التحقق بخطوتين قبل…» وطريقة تأكيد الهوية (لا سر هنا). مفتاح mfa لا security: صفحتا
+            // الملف الشخصي والأمان لهما prop باسم security يغلب المشترك
+            'mfa' => fn () => \App\Services\Security\Mfa::shared($user),
+            // مزايا خلف أعلام: القائمة تُخفي ما لم يُفعَّل بعد
+            'features' => [
+                // وحدة الواتساب كاملة (WhatsAppModule): القوائم والبطاقات والأقسام تُخفى حين تكون مطفأة
+                'whatsapp' => \App\Support\WhatsAppModule::enabled(),
+                'audit_page' => (bool) config('audit.page'),
+                // E31: رابط «المحظورون» لمن يملك whatsapp.block والعلم مفعّل (القراءة لهؤلاء وحدهم)
+                'wa_block' => \App\Support\WhatsAppModule::enabled() && $user?->can('whatsapp.block') ? rescue(fn () => \App\Support\FeatureFlags::on('wa_block'), false, false) : false,
+                // شريط الانقطاع والتعافي بعد النشر و«قد تكون أُرسلت» (E28، العلم connection_resilience)
+                'resilience' => \App\Services\WhatsApp\SendOutcome::enabled(),
+                // E40: «🔌 التكاملات» لمن يملك صلاحيتها وأحد العلمين مفعّل (لا استعلام لغيره)
+                'integrations' => (bool) rescue(fn () => $user && ($user->can('integrations.manage') || $user->can('mcp.use'))
+                    && (\App\Support\FeatureFlags::on('integration_outbox') || \App\Support\FeatureFlags::on('mcp_server')), false, false),
+                // E23: رابط «حالة النظام» لمن يملك ops.view والعلم مفعّل
+                'ops_status' => $user?->can('ops.view') ? rescue(fn () => \App\Support\FeatureFlags::on('ops_status_page'), false, false) : false,
+                // E24: رابط «الإخفاقات» لمن يملك whatsapp.settings والعلم failures_center مفعّل
+                'failures_center' => \App\Support\WhatsAppModule::enabled() && $user?->can('whatsapp.settings') ? rescue(fn () => \App\Support\FeatureFlags::on('failures_center'), false, false) : false,
+            ],
+            'unreadNotifications' => $user ? (int) \App\Models\Notification::where('user_id', $user->id)->where('is_read', false)->count() : 0,
+        ]);
+    }
+}

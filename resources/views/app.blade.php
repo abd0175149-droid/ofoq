@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta name="description" content="شركة أفق القمة للسياحة والسفر - نظام إدارة العمليات المالية والتشغيلية">
+
+    {{-- منع وميض الثيم: يُطبّق قبل أي رسم. nonce الطلب من سياسة أمن المحتوى (E26، SecurityHeaders) --}}
+    @php($cspNonce = \Illuminate\Support\Facades\Vite::cspNonce())
+    <script @if ($cspNonce) nonce="{{ $cspNonce }}" @endif>
+        (function(){
+            var t = localStorage.getItem('ofoq-theme');
+            if (t === 'dark') document.documentElement.classList.add('dark');
+            else document.documentElement.classList.remove('dark');
+        })();
+    </script>
+
+    <title inertia>شركة أفق القمة للسياحة والسفر</title>
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/png" href="/favicon.png?v=of1">
+    <link rel="icon" href="/favicon.ico?v=of1" sizes="any">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png?v=of1">
+
+    <!-- PWA -->
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#2b2b2b">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+    @routes(nonce: $cspNonce)
+    @vite(['resources/css/app.css', 'resources/js/app.js'])
+    @inertiaHead
+</head>
+<body class="antialiased">
+    @inertia
+</body>
+</html>

@@ -1,0 +1,218 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Exceptions\ApprovalConflict;
+use App\Models\Receipt;
+use App\Models\Client;
+use App\Services\NumberingService;
+use App\Services\BalanceService;
+use App\Services\AccountingService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Inertia\Inertia;
+
+class ReceiptController extends Controller
+{
+    public function index(Request $request)
+    {
+        $receipts = Receipt::query()
+            ->with(['client:id,name,code', 'creator:id,name', 'approver:id,name'])
+            ->when($request->search, fn ($q, $s) => $q->where('receipt_number', 'like', "%{$s}%")
+                ->orWhereHas('client', fn ($q2) => $q2->where('name', 'like', "%{$s}%")))
+            ->when($request->status, fn ($q, $s) => $q->where('status', $s))
+            ->orderByDesc('created_at')
+            ->paginate(15)
+            ->withQueryString();
+
+        return Inertia::render('Receipts/Index', [
+            'receipts' => $receipts,
+            'filters' => $request->only(['search', 'status']),
+            'clients' => Client::where('is_active', true)->select('id', 'name', 'code')->get(),
+        ]);
+    }
+
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'client_id' => 'required|exists:clients,id',
+            'amount_jod' => 'required|numeric|min:0.001',
+            'payment_method' => 'required|in:cash,bank,check',
+            'bank_commission' => 'nullable|numeric|min:0',
+            'check_number' => 'nullable|string|max:50',
+            'check_date' => 'nullable|date',
+            'check_bank' => 'nullable|string|max:100',
+            'notes' => 'nullable|string|max:1000',
+        ]);
+
+        // العمولة فقط عند الدفع البنكي
+        if ($validated['payment_method'] !== 'bank') {
+            $validated['bank_commission'] = 0;
+        } else {
+            $validated['bank_commission'] = $validated['bank_commission'] ?? 0;
+        }
+
+        $validated['receipt_number'] = NumberingService::generate('REC');
+        $validated['receipt_date'] = now()->toDateString();
+        $validated['status'] = 'pending';
+        $validated['created_by'] = auth()->id();
+
+        $receipt = Receipt::create($validated);
+
+        try { \App\Services\NotificationService::receiptCreated($receipt); } catch (\Exception $e) {}
+
+        return redirect()->route('receipts.index')
+            ->with('success', 'تم إنشاء سند القبض بنجاح');
+    }
+
+    public function approve(Receipt $receipt)
+    {
+        abort_unless(auth()->user()->can('receipts.approve'), 403);
+
+        if (!$receipt->isPending()) {
+            return back()->with('error', 'هذا السند ليس معلقاً');
+        }
+        if (!$receipt->approvableBy(auth()->user())) {
+            return back()->with('error', 'لا يعتمد المنشئ مستنده إلا المدير');
+        }
+
+        try {
+            DB::transaction(function () use ($receipt) {
+                $receipt->approve(auth()->user());
+                BalanceService::creditClient(
+                    $receipt->client,
+                    $receipt->amount_jod,
+                    'receipt',
+                    $receipt->id
+                );
+                // قيد محاسبي إلزامي — فشله يُلغي الاعتماد بالكامل
+                AccountingService::recordReceipt($receipt);
+                // ولا اعتماد بلا صف تدقيق: فشله يلغي الاعتماد أيضاً
+                \App\Models\AuditLog::log(\App\Enums\AuditAction::Approve, 'receipt', $receipt->id, $receipt->receipt_number, ['amount_jod' => (float) $receipt->amount_jod]);
+                try { \App\Services\NotificationService::receiptApproved($receipt); } catch (\Exception $e) {}
+            });
+        } catch (ApprovalConflict $e) {
+            return back()->with('error', $e->getMessage());
+        } catch (\Throwable $e) {
+            AccountingService::notifyFailure("اعتماد سند القبض {$receipt->receipt_number}", $e);
+            return back()->with('error', 'تعذّر اعتماد سند القبض محاسبياً ولم يُحفظ أي تغيير. تم إشعار الإدارة: ' . $e->getMessage());
+        }
+
+        return back()->with('success', 'تم اعتماد سند القبض');
+    }
+
+    public function reject(Request $request, Receipt $receipt)
+    {
+        abort_unless(auth()->user()->can('receipts.reject'), 403);
+
+        if (!$receipt->isPending()) {
+            return back()->with('error', 'هذا السند ليس معلقاً');
+        }
+
+        $request->validate(['rejection_reason' => 'required|string|max:500']);
+        DB::transaction(function () use ($receipt, $request) {
+            $receipt->reject(auth()->user(), $request->rejection_reason);
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::Reject, 'receipt', $receipt->id, $receipt->receipt_number, ['amount_jod' => (float) $receipt->amount_jod]);
+        });
+
+        try { \App\Services\NotificationService::operationRejected($receipt, 'سند قبض', $receipt->receipt_number); } catch (\Exception $e) {}
+
+        return back()->with('success', 'تم رفض سند القبض');
+    }
+
+    /**
+     * بدء تعديل سند قبض معتمد
+     */
+    public function startEdit(Receipt $receipt)
+    {
+        abort_unless(auth()->user()->can('admin'), 403);
+
+        if (!$receipt->isApproved()) {
+            return back()->with('error', 'يمكن تعديل السندات المعتمدة فقط');
+        }
+
+        DB::transaction(function () use ($receipt) {
+            // أول كتابة: approved → editing ذرياً، فلا يتكرر عكس الذمة مع نقرة مزدوجة
+            $receipt->startEditing(auth()->user());
+
+            // عكس تسديد ذمة العميل
+            BalanceService::reverseClientCredit($receipt->client, $receipt->amount_jod, 'receipt', $receipt->id);
+            // عكس القيد المحاسبي
+            $entry = \App\Models\JournalEntry::where('reference_type', 'receipt')
+                ->where('reference_id', $receipt->id)->where('is_reversed', false)->first();
+            if ($entry) try { AccountingService::reverseEntry($entry, 'تعديل سند القبض'); } catch (\Exception $e) {}
+
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::StartEdit, 'receipt', $receipt->id, $receipt->receipt_number);
+        });
+
+        return back()->with('success', "تم فتح سند القبض {$receipt->receipt_number} للتعديل");
+    }
+
+    /**
+     * تحديث سند قبض بعد الاعتماد
+     */
+    public function updateApproved(Request $request, Receipt $receipt)
+    {
+        abort_unless(auth()->user()->can('admin'), 403);
+
+        if (!$receipt->isEditing()) {
+            return back()->with('error', 'هذا السند ليس في وضع التعديل');
+        }
+
+        $validated = $request->validate([
+            'client_id' => 'required|exists:clients,id',
+            'amount_jod' => 'required|numeric|min:0.001',
+            'payment_method' => 'required|in:cash,bank,check',
+            'bank_commission' => 'nullable|numeric|min:0',
+            'check_number' => 'nullable|string|max:50',
+            'check_date' => 'nullable|date',
+            'check_bank' => 'nullable|string|max:100',
+            'notes' => 'nullable|string|max:1000',
+        ]);
+
+        if ($validated['payment_method'] !== 'bank') {
+            $validated['bank_commission'] = 0;
+        } else {
+            $validated['bank_commission'] = $validated['bank_commission'] ?? 0;
+        }
+
+        DB::transaction(function () use ($receipt, $validated) {
+            $receipt->resubmitForApproval();   // ذري: editing → pending
+            $receipt->update($validated);
+        });
+
+        return back()->with('success', "تم تعديل سند القبض وإرساله للاعتماد");
+    }
+
+    public function destroy(Receipt $receipt)
+    {
+        abort_unless(auth()->user()->can('admin'), 403);
+
+        if (!$receipt->isPending()) {
+            return back()->with('error', 'لا يمكن حذف سند معتمد');
+        }
+        // سند معلّق بلا أثر مالي، لكن حذفه لا يترك أثراً في الجدول نفسه
+        DB::transaction(function () use ($receipt) {
+            $receipt->delete();
+            \App\Models\AuditLog::log(\App\Enums\AuditAction::Delete, 'receipt', $receipt->id, $receipt->receipt_number, ['amount_jod' => (float) $receipt->amount_jod]);
+        });
+        return redirect()->route('receipts.index')->with('success', 'تم حذف سند القبض');
+    }
+
+    public function print(Receipt $receipt)
+    {
+        $receipt->load(['client:id,name,code', 'creator:id,name', 'approver:id,name']);
+
+        $template = \App\Models\Setting::where('key', 'print_template_financial')->first();
+        $templateUrl = $template?->value ? \Storage::url($template->value) : null;
+
+        $layoutSetting = \App\Models\Setting::where('key', 'print_layout_receipt')->first();
+        $layout = $layoutSetting?->value ? json_decode($layoutSetting->value, true) : null;
+
+        return Inertia::render('Receipts/Print', [
+            'receipt' => $receipt,
+            'templateUrl' => $templateUrl,
+            'layout' => $layout,
+        ]);
+    }
+}
